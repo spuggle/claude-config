@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Publish main to the skills mirrors (scripts/publish-skills.sh); commits on
+# claude in the worktree publish nothing.
+[ "$(git symbolic-ref --short HEAD 2>/dev/null)" = main ] || exit 0
+exec bash "$(git rev-parse --show-toplevel)/claude-worktree/scripts/publish-skills.sh"

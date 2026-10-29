@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Block pushes of personal data. Extend the denylist in ~/.config/claude-config/denylist (one ERE per line).
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+pat='192\.168\.|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}|BEGIN [A-Z ]*PRIVATE KEY|ghp_[A-Za-z0-9]{20,}'
+[ -f "$HOME/.config/claude-config/denylist" ] && pat="$pat|$(paste -sd'|' "$HOME/.config/claude-config/denylist")"
+if hits=$(git -C "$root" grep -nIE -e "$pat" -- . ':!.githooks'); then
+  echo "pre-push: denylist matches:" >&2; echo "$hits" >&2; exit 1
+fi

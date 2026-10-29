@@ -1,0 +1,2447 @@
+#!/usr/bin/env python3
+"""kb: categorised graph knowledge store (docs/kb/<topic>.json), operated by Claude and by hand.
+
+Paths are slash-separated names copied from the previous output (kb ls). Exit codes:
+0 ok, 1 not found or invalid, 2 usage, 3 store written by a newer kb (_schema too new).
+Data dir: $KB_DIR; else, when this script lives in a checkout <R> and <R>-worktrees/claude/docs/kb exists, that
+(for ~/.claude/skills it is ~/.claude/skills-worktrees/claude/docs/kb); else <R>/docs/kb. Without an explicit KB_DIR,
+writes are refused when the resolved store is in a checkout on the main branch that has a `claude` branch.
+"""
+import argparse
+import contextlib
+import copy
+import datetime
+import difflib
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.dont_write_bytecode = True
+SCHEMA = 1
+SELF = os.path.realpath(__file__)
+REPO = os.path.dirname(os.path.dirname(SELF))
+
+NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+ALIAS = re.compile(r"[a-z0-9][a-z0-9._-]*")
+DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+COMMON_FIELDS = {"id", "type", "title", "updated", "value", "body", "aliases", "links", "commits", "since", "until",
+                 "superseded_by", "supersedes", "hot"}
+EXTRA_FIELDS = {"item": {"area"}, "warning": {"noise", "shortcut"}}
+WARNING_KINDS = ("irrelevant-info", "slow-lookup")
+RELS = ("depends-on", "about", "evidence-for", "blocks", "part-of")
+KIND_RANK = {"user-action": 0, "waiting": 1, "backlog": 2}
+ITEM_KINDS = tuple(KIND_RANK)
+WRITTEN_BY = ("claude", "user")
+# decision fields that may change after recording (everything else is frozen)
+DECISION_MUTABLE = {"status", "links", "aliases", "commits", "updated", "until", "superseded_by", "supersedes", "since"}
+TREE_LINES, TREE_CHARS = 60, 4000
+HOT_CHARS, HOT_VALUE = 4000, 120
+STOP = {"the", "an", "of", "is", "my", "what", "where", "how", "do", "does", "to", "in", "on", "for", "and", "are", "who",
+        "when", "which", "why", "was", "it", "me", "with", "that", "this", "can", "did", "there", "have", "has", "our",
+        "or", "use", "uses", "used", "much"}
+
+# Per-type required fields (printed by `kb add --help`). Common to all types: id, type, title (1..100 chars),
+# updated; optional: value (one line), body[], aliases[], links[{rel,to}], commits[], since/until/superseded_by, hot.
+TYPES = {
+    "fact": (["value", "probe", "source"],
+             "value; probe {cmd[, timeout]} or {none: reason}; source {path, locator}"),
+    "item": (["kind", "status", "seq", "priority", "opened", "closed"],
+             "kind user-action|waiting|backlog; status open|done; seq (backlog order); priority int|null "
+             "(int for backlog); opened/closed dates (closed null while open); optional area"),
+    "decision": (["date", "decision", "status", "body"],
+                 "date; decision; status; body[] holds the original paragraph (frozen after recording; only status changes)"),
+    "artifact": (["path", "written_by", "chezmoi_source"],
+                 "path; written_by claude|user; chezmoi_source (string or null)"),
+    "procedure": (["steps", "thresholds"], "steps[] (strings); thresholds {}"),
+    "warning": (["scenario", "kind", "steps"],
+                "scenario (the task it arose in); kind irrelevant-info|slow-lookup; steps int (tool calls from the first lookup "
+                "to the one that gave the info used); optional noise (what was irrelevant), shortcut (the call that would have sufficed)"),
+    "context": (["scenario", "body"],
+                "scenario (when it applies); body[] holds the context to recall (not only exact facts)"),
+    "pitfall": ([], "common fields only"),
+    "preference": ([], "common fields only"),
+}
+
+
+class KBError(Exception):
+    def __init__(self, msg, code=1):
+        super().__init__(msg)
+        self.code = code
+
+
+def today():
+    return os.environ.get("KB_TODAY") or datetime.date.today().isoformat()
+
+
+def isdate(s):
+    if not (isinstance(s, str) and DATE.fullmatch(s)):
+        return False
+    try:
+        datetime.date.fromisoformat(s)
+        return True
+    except ValueError:
+        return False
+
+
+def slug(s, limit=48):
+    s = re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")
+    if len(s) > limit:
+        s = s[:limit].rsplit("-", 1)[0] if "-" in s[:limit] else s[:limit]
+    return s or "x"
+
+
+def dumps(tree):
+    return json.dumps(tree, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+
+
+# ---------------------------------------------------------------- probe-facts (runner and allowlists)
+_PF = None
+
+
+def probe_facts():
+    global _PF
+    if _PF is None:
+        path = os.path.join(REPO, "instruction-layer", "scripts", "probe-facts.py")
+        if not os.path.isfile(path):
+            raise KBError(f"probe runner {path} not found")
+        spec = importlib.util.spec_from_file_location("probe_facts", path)
+        _PF = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_PF)
+    return _PF
+
+
+# ---------------------------------------------------------------- store
+class Store:
+    def __init__(self, d):
+        self.dir = d
+        self.topics = {}
+        self.problems = []
+        self.broken = []   # unreadable or malformed topic files: no write is allowed while any exists
+
+
+def no_dup_keys(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError(f"duplicate key {k!r}")
+        d[k] = v
+    return d
+
+
+def data_dir():
+    e = os.environ.get("KB_DIR")
+    if e:
+        return e
+    sib = os.path.join(REPO + "-worktrees", "claude", "docs", "kb")
+    if os.path.isdir(sib):
+        return sib
+    return os.path.join(REPO, "docs", "kb")
+
+
+def _git(d, *args):
+    try:
+        r = subprocess.run(["git", "-C", d, *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def check_writable(d):
+    """Refuse to write a store that sits on the main branch of a checkout that has a claude branch (unless KB_DIR)."""
+    if os.environ.get("KB_DIR") or not os.path.isdir(d):
+        return
+    top = _git(d, "rev-parse", "--show-toplevel")
+    if not top:
+        return
+    branch = _git(d, "symbolic-ref", "--short", "-q", "HEAD")
+    if branch not in ("main", "master"):
+        return
+    if _git(d, "rev-parse", "--verify", "-q", "refs/heads/claude") is None:
+        return
+    wt = os.path.join(top + "-worktrees", "claude")
+    for line in (_git(d, "worktree", "list", "--porcelain") or "").split("\n\n"):
+        if "branch refs/heads/claude" in line.split("\n"):
+            wt = line.split("\n")[0][len("worktree "):]
+    raise KBError(f"refusing to write {d}: it is on branch {branch} of {top}, which has a claude branch. "
+                  f"Write through the claude worktree: {os.path.join(wt, 'scripts', 'kb')} "
+                  f"(store {os.path.join(wt, 'docs', 'kb')}), or set KB_DIR to override.")
+
+
+def load(d):
+    if not os.path.isdir(d):
+        raise KBError(f"no store at {d} (create a topic with: kb mkcat TOPIC --title T)")
+    st = Store(d)
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".json") or fn.startswith("."):
+            continue
+        topic = fn[:-5]
+        if not NAME.fullmatch(topic):
+            st.problems.append(f"{fn}: topic file name must match [a-z0-9][a-z0-9-]*.json")
+            st.broken.append(fn)
+            continue
+        try:
+            with open(os.path.join(d, fn), encoding="utf-8") as f:
+                tree = json.load(f, object_pairs_hook=no_dup_keys)
+        except (ValueError, OSError) as ex:
+            st.problems.append(f"{fn}: malformed JSON ({ex})")
+            st.broken.append(fn)
+            continue
+        if not isinstance(tree, dict):
+            st.problems.append(f"{fn}: top level must be an object")
+            st.broken.append(fn)
+            continue
+        sch = tree.get("_schema")
+        if isinstance(sch, int) and not isinstance(sch, bool) and sch > SCHEMA:
+            raise KBError(f"{fn}: _schema {sch} is newer than this kb understands ({SCHEMA}); update scripts/kb", 3)
+        if sch != SCHEMA:
+            st.problems.append(f"{fn}: _schema must be {SCHEMA}")
+        st.topics[topic] = tree
+    return st
+
+
+@contextlib.contextmanager
+def locked(d):
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, ".lock"), "a+") as lk:
+        try:
+            import fcntl
+        except ImportError:  # Windows: lock one byte with msvcrt, retrying for about 10 s
+            import msvcrt
+            lk.seek(0)
+            for attempt in range(10):
+                try:
+                    msvcrt.locking(lk.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    if attempt == 9:
+                        raise
+            try:
+                yield
+            finally:
+                lk.seek(0)
+                msvcrt.locking(lk.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        yield
+
+
+def stage(path, text):
+    """Write text to a fsynced temp file (mode 0644) next to path; return the temp name."""
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".kb-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o644)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return tmp
+
+
+def sync_dir(d):
+    dfd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def atomic_write(path, text):
+    tmp = stage(path, text)
+    try:
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    sync_dir(os.path.dirname(os.path.abspath(path)))
+
+
+def mutate(fn, create=False):
+    """Lock, load fresh, apply fn(store, idx), refuse new validation errors, write changed files. Returns fn's result."""
+    d = data_dir()
+    check_writable(d)
+    if create:
+        os.makedirs(d, exist_ok=True)
+    elif not os.path.isdir(d):
+        raise KBError(f"no store at {d} (create a topic with: kb mkcat TOPIC --title T)")
+    with locked(d):
+        st = load(d)
+        if st.broken:
+            raise KBError("refusing to write while a topic file is unreadable or malformed (fix or restore it first): "
+                          + "; ".join(p for p in st.problems if p.split(":")[0] in st.broken))
+        before_text = {t: dumps(tr) for t, tr in st.topics.items()}
+        before_errs = set(validate(st, probe_ids=set())[0])
+        before_probe = probe_map(st)
+        res = fn(st, build_index(st, []))
+        after_text = {t: dumps(tr) for t, tr in st.topics.items()}
+        changed = {i for i, p in probe_map(st).items() if before_probe.get(i) != p}
+        errs, _ = validate(st, probe_ids=changed)
+        new = [e for e in errs if e not in before_errs]
+        if new:
+            raise KBError("\n".join("kb: " + e for e in new) + "\nkb: nothing written")
+        # stage every file first, then rename: files that gain entries before files that lose them, deletions
+        # last, so a crash can duplicate an entry but never lose one
+        def gains(t):
+            old = subtree_ids(json.loads(before_text[t])) if t in before_text else set()
+            return bool(subtree_ids(st.topics[t]) - old)
+        changed = sorted((t for t in after_text if before_text.get(t) != after_text[t]),
+                         key=lambda t: (0 if gains(t) else 1, t))
+        staged = []
+        try:
+            for t in changed:
+                staged.append((stage(os.path.join(d, t + ".json"), after_text[t]), os.path.join(d, t + ".json")))
+        except BaseException:
+            for tmp, _ in staged:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+            raise
+        try:
+            for k, (tmp, dest) in enumerate(staged):
+                os.replace(tmp, dest)
+        except BaseException:
+            for tmp, _ in staged[k:]:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+            raise
+        for t in before_text:
+            if t not in after_text:
+                os.unlink(os.path.join(d, t + ".json"))
+        if staged or len(before_text) != len(after_text):
+            sync_dir(d)
+        return res
+
+
+def probe_map(st):
+    idx = build_index(st, [])
+    return {i: json.dumps(n.get("probe"), sort_keys=True) for i, n in idx.nodes.items()}
+
+
+# ---------------------------------------------------------------- tree helpers
+def is_ref(n):
+    return isinstance(n, dict) and "$ref" in n
+
+
+def is_entry(n):
+    return isinstance(n, dict) and "$ref" not in n and isinstance(n.get("type"), str)
+
+
+def is_cat(n):
+    return isinstance(n, dict) and "$ref" not in n and not isinstance(n.get("type"), str)
+
+
+def child_names(cat):
+    return [k for k in cat if not k.startswith("_")]
+
+
+class Index:
+    def __init__(self):
+        self.paths = {}      # path -> node (topics, categories, entries, refs)
+        self.nodes = {}      # id -> entry node
+        self.home = {}       # id -> path
+        self.refs = []       # (path, target, node)
+        self.cats = []       # category paths
+        self.aliases = {}    # alias -> [(path, "category"|"entry")]
+        self.dupids = []     # (id, path)
+
+    def entries(self):
+        for i in sorted(self.nodes):
+            yield i, self.home[i]
+
+
+def build_index(st, errs):
+    idx = Index()
+    for topic in sorted(st.topics):
+        tree = st.topics[topic]
+        if not NAME.fullmatch(topic):
+            errs.append(f"{topic}.json: topic name must match [a-z0-9][a-z0-9-]*")
+        idx.paths[topic] = tree
+        walk_cat(idx, tree, topic, errs)
+    return idx
+
+
+def walk_cat(idx, node, path, errs):
+    idx.cats.append(path)
+    t = node.get("_title")
+    if not isinstance(t, str) or not t.strip() or "\n" in t:
+        errs.append(f"{path}: category needs a one-line _title")
+    for k in node:
+        if k.startswith("_") and k not in ("_title", "_aliases", "_schema"):
+            errs.append(f"{path}: unknown metadata key {k}")
+    al = node.get("_aliases", [])
+    if not isinstance(al, list):
+        errs.append(f"{path}: _aliases must be a list")
+        al = []
+    for a in al:
+        if isinstance(a, str) and ALIAS.fullmatch(a):
+            idx.aliases.setdefault(a, []).append((path, "category"))
+        else:
+            errs.append(f"{path}: bad alias {a!r} (lowercase letters, digits, . _ -)")
+    for k in sorted(child_names(node)):
+        p = path + "/" + k
+        n = node[k]
+        idx.paths[p] = n
+        if not NAME.fullmatch(k) or k == "type":
+            errs.append(f"{p}: name must match [a-z0-9][a-z0-9-]* and not be 'type'")
+        if not isinstance(n, dict):
+            errs.append(f"{p}: must be an object")
+        elif is_ref(n):
+            if set(n) != {"$ref"} or not isinstance(n["$ref"], str):
+                errs.append(f"{p}: a ref is exactly {{\"$ref\": id}}")
+            else:
+                idx.refs.append((p, n["$ref"], n))
+        elif is_entry(n):
+            i = n.get("id")
+            if isinstance(i, str):
+                if i in idx.nodes:
+                    idx.dupids.append((i, p))
+                    errs.append(f"{p}: duplicate id {i} (also at {idx.home[i]})")
+                else:
+                    idx.nodes[i], idx.home[i] = n, p
+            for a in n.get("aliases", []) if isinstance(n.get("aliases"), list) else []:
+                if isinstance(a, str) and ALIAS.fullmatch(a):
+                    idx.aliases.setdefault(a, []).append((p, "entry"))
+            check_entry(n, p, errs, [])
+        else:
+            walk_cat(idx, n, p, errs)
+
+
+def sort_children(cat):
+    def key(k):
+        n = cat[k]
+        seq = n.get("seq") if isinstance(n, dict) and isinstance(n.get("seq"), int) else 10**9
+        return (0 if is_cat(n) else 1, seq, k)
+    return sorted(child_names(cat), key=key)
+
+
+# ---------------------------------------------------------------- validation
+def check_entry(e, p, errs, warns):
+    def bad(msg):
+        errs.append(f"{p}: {msg}")
+    i = e.get("id")
+    if not (isinstance(i, str) and NAME.fullmatch(i)):
+        bad("id must be a slug [a-z0-9-]+")
+    t = e.get("type")
+    if t not in TYPES:
+        bad(f"type must be one of {', '.join(sorted(TYPES))}")
+        return
+    ti = e.get("title")
+    if not isinstance(ti, str) or not 1 <= len(ti) <= 100 or "\n" in ti:
+        bad("title must be a single line of 1..100 chars")
+    if not isdate(e.get("updated")):
+        bad("updated must be YYYY-MM-DD")
+    if "value" in e:
+        v = e["value"]
+        if not isinstance(v, str) or not v.strip() or "\n" in v:
+            bad("value must be a non-empty single line")
+        elif len(v) > 200:
+            warns.append(f"{p}: value is {len(v)} chars (over 200); move detail to body[]")
+    if "hot" in e and not isinstance(e["hot"], bool):
+        bad("hot must be true or false")
+    if e.get("hot") is True and not (isinstance(e.get("aliases"), list) and e["aliases"] and isinstance(e.get("value"), str)):
+        bad("a hot entry needs an alias and a value")
+    elif e.get("hot") is True and len(e["value"]) > HOT_VALUE:
+        bad(f"a hot entry's value is at most {HOT_VALUE} chars (it is {len(e['value'])}); shorten it or unmark hot")
+    for f in ("body", "aliases", "commits", "supersedes"):
+        if f in e and not (isinstance(e[f], list) and all(isinstance(x, str) for x in e[f])):
+            bad(f"{f} must be a list of strings")
+    for a in e.get("aliases", []) if isinstance(e.get("aliases"), list) else []:
+        if not (isinstance(a, str) and ALIAS.fullmatch(a)):
+            bad(f"bad alias {a!r}")
+    for c in e.get("commits", []) if isinstance(e.get("commits"), list) else []:
+        if isinstance(c, str) and not re.fullmatch(r"[0-9a-f]{4,40}", c):
+            bad(f"commit {c!r} is not a hex sha")
+    if "links" in e:
+        if not isinstance(e["links"], list):
+            bad("links must be a list")
+        else:
+            for l in e["links"]:
+                if not (isinstance(l, dict) and set(l) == {"rel", "to"} and l["rel"] in RELS and isinstance(l["to"], str)):
+                    bad(f"link must be {{rel, to}} with rel one of {', '.join(RELS)}: {l!r}")
+    for f in ("since", "until"):
+        if f in e and not isdate(e[f]):
+            bad(f"{f} must be YYYY-MM-DD")
+    if "superseded_by" in e and not (isinstance(e["superseded_by"], str) and e.get("until")):
+        bad("superseded_by must be an id and requires until")
+    for f in TYPES[t][0]:
+        if f not in e:
+            bad(f"{t} requires {f}")
+    for f in sorted(set(e) - COMMON_FIELDS - set(TYPES[t][0]) - EXTRA_FIELDS.get(t, set())):
+        bad(f"unknown field {f} for type {t}")
+    if t == "fact":
+        pr, src = e.get("probe"), e.get("source")
+        if "probe" in e:
+            if not isinstance(pr, dict):
+                bad("probe must be {cmd[, timeout]} or {none: reason}")
+            elif set(pr) == {"none"}:
+                if not (isinstance(pr["none"], str) and pr["none"].strip()):
+                    bad("probe.none needs a reason")
+            elif not (set(pr) <= {"cmd", "timeout"} and isinstance(pr.get("cmd"), str) and pr["cmd"].strip()):
+                bad("probe must be {cmd[, timeout]} or {none: reason}")
+            elif "timeout" in pr and not (isinstance(pr["timeout"], (int, float)) and not isinstance(pr["timeout"], bool)
+                                          and pr["timeout"] > 0):
+                bad("probe.timeout must be a positive number of seconds")
+        if "source" in e and not (isinstance(src, dict) and set(src) == {"path", "locator"}
+                                  and all(isinstance(v, str) for v in src.values()) and src["path"].strip()):
+            bad("source must be {path, locator} (strings, path non-empty)")
+    elif t == "item":
+        k, st, pr = e.get("kind"), e.get("status"), e.get("priority")
+        if "kind" in e and k not in ITEM_KINDS:
+            bad("kind must be user-action, waiting or backlog")
+        if "status" in e and st not in ("open", "done"):
+            bad("status must be open or done")
+        if "seq" in e and not (isinstance(e["seq"], int) and not isinstance(e["seq"], bool)):
+            bad("seq must be an integer")
+        isint = isinstance(pr, int) and not isinstance(pr, bool)
+        if "priority" in e and k == "backlog" and not isint:
+            bad("backlog needs an integer priority")
+        elif "priority" in e and pr is not None and not isint:
+            bad("priority must be an integer or null")
+        if "opened" in e and not isdate(e["opened"]):
+            bad("opened must be YYYY-MM-DD")
+        if "closed" in e and e["closed"] is not None and not isdate(e["closed"]):
+            bad("closed must be YYYY-MM-DD or null")
+        if st == "done" and e.get("closed") is None and "closed" in e:
+            bad("done requires a closed date")
+        if st == "open" and e.get("closed") is not None:
+            bad("an open item must have closed null")
+        if "area" in e and not (isinstance(e["area"], str) and e["area"]):
+            bad("area must be a non-empty string")
+    elif t == "decision":
+        if "date" in e and not isdate(e["date"]):
+            bad("date must be YYYY-MM-DD")
+        for f in ("decision", "status"):
+            if f in e and not (isinstance(e[f], str) and e[f].strip()):
+                bad(f"{f} must be a non-empty string")
+        if "body" in e and not (isinstance(e["body"], list) and e["body"]):
+            bad("decision body[] must hold the original paragraph")
+    elif t == "warning":
+        if "scenario" in e and not (isinstance(e["scenario"], str) and e["scenario"].strip()):
+            bad("scenario must be a non-empty string")
+        if "kind" in e and e["kind"] not in WARNING_KINDS:
+            bad("kind must be irrelevant-info or slow-lookup")
+        if "steps" in e and not (isinstance(e["steps"], int) and not isinstance(e["steps"], bool) and e["steps"] >= 0):
+            bad("steps must be a non-negative integer")
+        for f in ("noise", "shortcut"):
+            if f in e and not (isinstance(e[f], str) and e[f].strip()):
+                bad(f"{f} must be a non-empty string")
+    elif t == "context":
+        if "scenario" in e and not (isinstance(e["scenario"], str) and e["scenario"].strip()):
+            bad("scenario must be a non-empty string")
+        if "body" in e and not (isinstance(e["body"], list) and e["body"]):
+            bad("context body[] must hold the context")
+    elif t == "artifact":
+        if "path" in e and not (isinstance(e["path"], str) and e["path"]):
+            bad("path must be a non-empty string")
+        if "written_by" in e and e["written_by"] not in WRITTEN_BY:
+            bad("written_by must be claude or user")
+        if "chezmoi_source" in e and not (e["chezmoi_source"] is None or isinstance(e["chezmoi_source"], str)):
+            bad("chezmoi_source must be a string or null")
+    elif t == "procedure":
+        if "steps" in e and not (isinstance(e["steps"], list) and e["steps"] and all(isinstance(s, str) for s in e["steps"])):
+            bad("steps must be a non-empty list of strings")
+        if "thresholds" in e and not isinstance(e["thresholds"], dict):
+            bad("thresholds must be an object")
+
+
+def validate(st, probe_ids=None, orphans=False):
+    """Return (errors, warnings). probe_ids: ids whose probe safety is checked (None = all)."""
+    errs, warns = [], []
+    for pr in st.problems:
+        errs.append(pr)
+    idx = build_index(st, errs)
+    for i, p in idx.entries():
+        check_entry(idx.nodes[i], p, [], warns)
+    # aliases
+    for a, where in sorted(idx.aliases.items()):
+        if len(where) > 1:
+            errs.append(f"alias {a} is used {len(where)} times: " + ", ".join(w[0] for w in where))
+        if a in st.topics and not (len(where) == 1 and where[0][0] == a):
+            errs.append(f"{where[0][0]}: alias {a} shadows the topic {a}")
+        if a in idx.nodes and idx.home[a] != where[0][0]:
+            errs.append(f"{where[0][0]}: alias {a} equals the id of {idx.home[a]}")
+    for i, p in idx.entries():
+        if i in st.topics:
+            errs.append(f"{p}: id {i} equals the topic {i}")
+        if i in idx.aliases:
+            errs.append(f"{p}: id {i} equals an alias at {idx.aliases[i][0][0]}")
+    seqs = {}
+    for i, p in idx.entries():
+        e = idx.nodes[i]
+        if e.get("type") == "item" and isinstance(e.get("seq"), int) and not isinstance(e["seq"], bool):
+            if e["seq"] in seqs:
+                errs.append(f"{p}: duplicate item seq {e['seq']} (also {seqs[e['seq']]})")
+            seqs.setdefault(e["seq"], p)
+    # links
+    for i, p in idx.entries():
+        e = idx.nodes[i]
+        for l in e.get("links", []) if isinstance(e.get("links"), list) else []:
+            if isinstance(l, dict) and isinstance(l.get("to"), str):
+                if l["to"] not in idx.nodes:
+                    errs.append(f"{p}: link to unknown id {l['to']}")
+                elif l["to"] == i:
+                    errs.append(f"{p}: link to itself")
+    # refs
+    pairs = set()
+    for p, target, _ in idx.refs:
+        cat = p.rsplit("/", 1)[0]
+        if target in idx.nodes:
+            home = idx.home[target]
+            if home.rsplit("/", 1)[0] == cat:
+                errs.append(f"{p}: ref in the home category of {target}")
+            for j, jp in idx.home.items():
+                if jp.rsplit("/", 1)[0] != cat or j == target:
+                    continue
+                linked = any(l.get("to") == target for l in idx.nodes[j].get("links", []) if isinstance(l, dict)) \
+                    if isinstance(idx.nodes[j].get("links"), list) else False
+                back = any(l.get("to") == j for l in idx.nodes[target].get("links", []) if isinstance(l, dict)) \
+                    if isinstance(idx.nodes[target].get("links"), list) else False
+                if linked or back:
+                    pairs.add(f"{p}: {target} is both a ref here and linked with {j}; use one or the other")
+        elif target in idx.paths and is_ref(idx.paths[target]):
+            errs.append(f"{p}: ref to a ref ({target})")
+        else:
+            errs.append(f"{p}: ref to unknown id {target}")
+    errs.extend(sorted(pairs))
+    # supersede chains
+    for i, p in idx.entries():
+        e = idx.nodes[i]
+        nxt = e.get("superseded_by")
+        if nxt is not None:
+            if nxt not in idx.nodes:
+                errs.append(f"{p}: superseded_by unknown id {nxt}")
+            elif i not in idx.nodes[nxt].get("supersedes", []):
+                errs.append(f"{p}: superseded_by {nxt}, which does not list {i} in supersedes")
+        for old in e.get("supersedes", []) if isinstance(e.get("supersedes"), list) else []:
+            if old not in idx.nodes:
+                errs.append(f"{p}: supersedes unknown id {old}")
+            elif idx.nodes[old].get("superseded_by") != i:
+                errs.append(f"{p}: supersedes {old}, which is not superseded_by it")
+        seen, cur = {i}, nxt
+        while cur is not None and cur in idx.nodes:
+            if cur in seen:
+                errs.append(f"{p}: supersede chain has a cycle at {cur}")
+                break
+            seen.add(cur)
+            cur = idx.nodes[cur].get("superseded_by")
+    # probe safety
+    facts = [(p, e) for i, p in idx.entries() for e in [idx.nodes[i]]
+             if e.get("type") == "fact" and isinstance(e.get("probe"), dict) and isinstance(e["probe"].get("cmd"), str)
+             and (probe_ids is None or e.get("id") in probe_ids)]
+    if facts:
+        try:
+            pf = probe_facts()
+            for (p, e), why in zip(facts, pf.verdicts([e["probe"]["cmd"] for _, e in facts])):
+                if why:
+                    errs.append(f"{p}: probe is not read-only: {why}")
+        except KBError as ex:
+            warns.append(f"probe safety not checked: {ex}")
+        except Exception as ex:  # ShfmtMissing
+            if type(ex).__name__ == "ShfmtMissing":
+                warns.append("shfmt not installed; probe safety not checked")
+            else:
+                raise
+    if orphans:
+        for c in idx.cats:
+            if not child_names(idx.paths[c]):
+                warns.append(f"{c}: empty category")
+        for i, p in idx.entries():
+            e = idx.nodes[i]
+            if e.get("type") == "fact":
+                pr, src = e.get("probe"), e.get("source")
+                if isinstance(pr, dict) and "none" in pr:
+                    warns.append(f"{p}: fact has no probe ({pr['none']})")
+                if not isinstance(src, dict) or not src.get("locator", "").strip():
+                    warns.append(f"{p}: fact has no source locator")
+    return errs, warns
+
+
+# ---------------------------------------------------------------- resolving
+def nearest(idx, parts, upto):
+    """Message listing what exists where the path stops."""
+    base = "/".join(parts[:upto])
+    node = idx.paths.get(base) if upto else None
+    if upto == 0:
+        names = sorted(t for t in idx.paths if "/" not in t)
+        names += sorted(a for a in idx.aliases if idx.aliases[a][0][1] == "category")
+    elif node is not None and is_cat(node):
+        names = sorted(child_names(node))
+    else:
+        names = []
+    want = parts[upto] if upto < len(parts) else ""
+    close = difflib.get_close_matches(want, names, n=3, cutoff=0.5)
+    msg = ""
+    if close:
+        msg += "did you mean: " + ", ".join((base + "/" if base else "") + c for c in close) + "\n"
+    if names:
+        shown = names[:20]
+        msg += f"under {base or '(top)'}: " + ", ".join(shown) + (f" (+{len(names) - 20} more)" if len(names) > 20 else "")
+    return msg
+
+
+def resolve(idx, arg):
+    """-> (path, node, via) for a path, entry id, alias or alias/rest. Refs resolve to their entry; raises KBError."""
+    a = arg.strip().strip("/")
+    via = None
+    if a in idx.paths:
+        path = a
+    elif a in idx.nodes:
+        path, via = idx.home[a], f"id {a}"
+    else:
+        first, _, rest = a.partition("/")
+        first = re.sub(r"\s+", "-", first.strip())  # 'launch options' finds the alias launch-options
+        hit = idx.aliases.get(first)
+        if hit and len(hit) > 1:
+            raise KBError(f"ambiguous: alias {first} matches " + ", ".join(sorted(h[0] for h in hit)))
+        if hit and len(hit) == 1:
+            base = hit[0][0]
+            path = base + ("/" + rest if rest else "")
+            via = f"alias {first} -> {base}"
+            if path not in idx.paths:
+                parts = path.split("/")
+                k = max((i for i in range(len(parts)) if "/".join(parts[:i + 1]) in idx.paths), default=-1) + 1
+                raise KBError(f"not found: {arg} (alias {first} -> {base})\n" + nearest(idx, parts, k))
+        else:
+            parts = a.split("/") if a else []
+            k = 0
+            while k < len(parts) and "/".join(parts[:k + 1]) in idx.paths:
+                k += 1
+            raise KBError(f"not found: {arg}\n" + nearest(idx, parts, k))
+    node = idx.paths[path]
+    if is_ref(node):
+        t = node["$ref"]
+        if t not in idx.nodes:
+            raise KBError(f"{path}: dangling ref to {t}")
+        via = (via + "; " if via else "") + f"ref {path} -> {idx.home[t]}"
+        return idx.home[t], idx.nodes[t], via
+    return path, node, via
+
+
+def title_of(n):
+    return n.get("_title") if is_cat(n) else n.get("title", "")
+
+
+def superseded(n):
+    return is_entry(n) and bool(n.get("superseded_by"))
+
+
+def visible(n, history=False, all_=False):
+    if is_entry(n):
+        if not history and n.get("superseded_by"):
+            return False
+        if not all_ and n.get("type") == "item" and n.get("status") == "done":
+            return False
+    return True
+
+
+def count_visible(idx, node, history, all_):
+    c = 0
+    for k in child_names(node):
+        n = node[k]
+        if is_cat(n):
+            c += count_visible(idx, n, history, all_)
+        elif is_ref(n):
+            t = idx.nodes.get(n["$ref"])
+            c += 1 if t is not None and visible(t, history, all_) else 0
+        elif visible(n, history, all_):
+            c += 1
+    return c
+
+
+def line_for(idx, cat, k, history, all_, counts=True, indent=""):
+    """One ls line for child k of cat, or None when hidden."""
+    n = cat[k]
+    if is_cat(n):
+        c = f"  ({count_visible(idx, n, history, all_)})" if counts else ""
+        return f"{indent}{k}/  {n.get('_title', '')}{c}"
+    if is_ref(n):
+        t = idx.nodes.get(n["$ref"])
+        if t is None:
+            return f"{indent}{k}  (dangling ref {n['$ref']})"
+        if not visible(t, history, all_):
+            return None
+        return f"{indent}{k}  {t.get('title', '')}  -> {idx.home[t['id']]}"
+    if not visible(n, history, all_):
+        return None
+    tag = "  [done]" if n.get("type") == "item" and n.get("status") == "done" else ""
+    if n.get("superseded_by"):
+        tag = f"  [superseded by {n['superseded_by']}]"
+    return f"{indent}{k}  {n.get('title', '')}{tag}"
+
+
+# ---------------------------------------------------------------- output
+def out(s=""):
+    print(s)
+
+
+def jout(o):
+    print(json.dumps(o, sort_keys=True, indent=2, ensure_ascii=False))
+
+
+def fmt_entry(idx, path, e, via=None, cache=None, body=False):
+    L = []
+    if via:
+        L.append(f"via: {via}")
+    L.append(f"at: {path}")
+    for k in ("id", "type", "title", "value"):
+        if k in e:
+            L.append(f"{k}: {e[k]}")
+    skip = {"id", "type", "title", "value", "body", "links", "probe", "source", "commits", "supersedes"}
+    for k in sorted(e):
+        if k in skip:
+            continue
+        v = e[k]
+        if isinstance(v, list) and all(isinstance(x, str) for x in v):
+            v = ", ".join(v)
+        L.append(f"{k}: {v if isinstance(v, str) else json.dumps(v, sort_keys=True, ensure_ascii=False)}")
+    if "probe" in e:
+        pr = e["probe"]
+        if isinstance(pr, dict) and "cmd" in pr:
+            L.append(f"probe: {pr['cmd']}" + (f"  (timeout {pr['timeout']:g}s)" if "timeout" in pr else ""))
+        else:
+            L.append(f"probe: none ({pr.get('none') if isinstance(pr, dict) else pr})")
+    if "source" in e and isinstance(e["source"], dict):
+        L.append(f"source: {e['source'].get('path')} :: {e['source'].get('locator')}")
+    if e.get("commits"):
+        L.append("commits: " + " ".join(e["commits"]))
+    if e.get("supersedes"):
+        L.append("supersedes: " + " ".join(e["supersedes"]))
+    if e.get("body"):
+        if body:
+            L.append("body:")
+            L.extend("  " + b for b in e["body"])
+        else:
+            L.append(f"body: {len(e['body'])} lines (--body shows them)")
+    for l in sorted(e.get("links", []), key=lambda x: (x.get("rel", ""), x.get("to", ""))):
+        t = idx.nodes.get(l.get("to"))
+        L.append(f"link: {l.get('rel')} -> {l.get('to')}" + (f"  ({idx.home[l['to']]})" if t else "  (unknown)"))
+    refs = sorted(p for p, tgt, _ in idx.refs if tgt == e.get("id"))
+    for p in refs:
+        L.append(f"also at: {p.rsplit('/', 1)[0]}")
+    if cache:
+        v = cache.get("local:" + str(e.get("id")))
+        if v:
+            L.append(f"verified: {v}")
+    return "\n".join(L)
+
+
+# ---------------------------------------------------------------- verified cache
+def cache_path():
+    return os.environ.get("KB_CACHE") or os.path.expanduser("~/.cache/kb/verified.json")
+
+
+def cache_load():
+    try:
+        with open(cache_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        v = d.get("verified")
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def cache_update(add, drop):
+    p = cache_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with locked(os.path.dirname(p)):
+        v = cache_load()
+        v.update(add)
+        for k in drop:
+            v.pop(k, None)
+        atomic_write(p, dumps({"_schema": 1, "verified": v}))
+
+
+def parse_age(s):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhdw])", s)
+    if not m:
+        raise KBError(f"bad duration {s!r} (examples: 90s, 30m, 12h, 30d, 2w)", 2)
+    return float(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+
+
+def verified_age(cache, key, now):
+    """Seconds since key was last verified, or None when unknown or the stored time is corrupt."""
+    try:
+        return (now - from_iso(cache[key])).total_seconds()
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def iso(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def from_iso(s):
+    return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+
+
+# ---------------------------------------------------------------- read commands
+def read_store():
+    st = load(data_dir())
+    for p in st.problems:
+        print(f"kb: warning: {p}", file=sys.stderr)
+    return st, build_index(st, [])
+
+
+def cmd_ls(a):
+    st, idx = read_store()
+    if not a.path:
+        if a.tree:
+            lines = []
+            for t in sorted(st.topics):
+                tree_lines(idx, st.topics[t], t, 0, a, lines, top=True)
+            return print_tree(lines)
+        tops = [(t, st.topics[t].get("_title", "")) for t in sorted(st.topics)]
+        if a.json:
+            return jout([{"name": t, "title": ti, "count": count_visible(idx, st.topics[t], a.history, a.all)}
+                         for t, ti in tops])
+        for t, ti in tops:
+            out(f"{t} - {ti}")
+        if not tops:
+            print("kb: store is empty (add a topic: kb mkcat TOPIC --title T)", file=sys.stderr)
+        return 0
+    path, node, via = resolve(idx, a.path)
+    if via and not a.json:
+        print(f"[{via}]", file=sys.stderr)
+    if is_entry(node):
+        if a.json:
+            jout({"at": path, "via": via, "entry": node})
+        else:
+            out(fmt_entry(idx, path, node, body=getattr(a, "body", False)))
+        return 0
+    if a.tree:
+        lines = [f"{path}/  {node.get('_title', '')}"]
+        tree_lines(idx, node, path, 1, a, lines)
+        return print_tree(lines)
+    rows = []
+    for k in sort_children(node):
+        line = line_for(idx, node, k, a.history, a.all)
+        if line is not None:
+            rows.append((k, line))
+    if a.json:
+        jout([{"name": k, "path": f"{path}/{k}", "line": ln} for k, ln in rows])
+    else:
+        for _, ln in rows:
+            out(ln)
+        if not rows:
+            print(f"kb: {path} is empty", file=sys.stderr)
+    return 0
+
+
+def tree_lines(idx, cat, path, depth, a, lines, top=False):
+    if top:
+        lines.append(f"{path}/  {cat.get('_title', '')}")
+        depth = 1
+    for k in sort_children(cat):
+        n = cat[k]
+        ln = line_for(idx, cat, k, a.history, a.all, counts=False, indent="  " * depth)
+        if ln is None:
+            continue
+        lines.append(ln)
+        if is_cat(n):
+            tree_lines(idx, n, path + "/" + k, depth + 1, a, lines)
+
+
+def print_tree(lines):
+    kept, chars = [], 0
+    for ln in lines:
+        if len(kept) >= TREE_LINES - 1 or chars + len(ln) + 1 > TREE_CHARS:
+            break
+        kept.append(ln)
+        chars += len(ln) + 1
+    if len(kept) == len(lines):
+        out("\n".join(kept))
+        return 0
+    if len(lines) - len(kept) == 1 and len(kept) == TREE_LINES - 1 and chars + len(lines[-1]) + 1 <= TREE_CHARS:
+        kept.append(lines[-1])
+        out("\n".join(kept))
+        return 0
+    out("\n".join(kept))
+    out(f"... {len(lines) - len(kept)} lines cut (drill down with: kb ls PATH)")
+    return 0
+
+
+def all_nodes(idx):
+    """Yield (path, node, kind) for every category and home entry."""
+    for c in sorted(idx.cats):
+        yield c, idx.paths[c], "category"
+    for i, p in idx.entries():
+        yield p, idx.nodes[i], "entry"
+
+
+def cmd_find(a):
+    if not a.words and not (a.type or a.under):
+        raise KBError("find without WORDS needs --type or --under", 2)
+    st, idx = read_store()
+    under = resolve(idx, a.under)[0] if a.under else None
+    words = [w.lower() for w in " ".join(a.words).split()]
+    hits = []
+    for p, n, kind in all_nodes(idx):
+        if under and not (p == under or p.startswith(under + "/")):
+            continue
+        if kind == "entry":
+            if superseded(n) and not a.history:
+                continue
+            if a.type and n.get("type") != a.type:
+                continue
+            if a.status and n.get("status") != a.status:
+                continue
+        elif a.type or a.status:
+            continue
+        hay = " ".join([p.rsplit("/", 1)[-1], title_of(n) or "", *(n.get("_aliases") or n.get("aliases") or [])]).lower()
+        if all(w in hay for w in words):
+            hits.append((p, title_of(n), kind))
+    if not hits:
+        msg = "kb: no match for " + " ".join(a.words) + " (not recorded)"
+        tops = [f"{t} - {st.topics[t].get('_title', '')}" for t in sorted(st.topics)]
+        scored = difflib.get_close_matches(" ".join(words), sorted(idx.paths), n=3, cutoff=0.4)
+        print(msg, file=sys.stderr)
+        if scored:
+            print("nearest: " + ", ".join(scored), file=sys.stderr)
+        print("topics: " + "; ".join(tops), file=sys.stderr)
+        return 1
+    if a.json:
+        jout([{"path": p, "title": t, "kind": k} for p, t, k in hits])
+    else:
+        for p, t, k in hits:
+            out(f"{p}{'/' if k == 'category' else ''}  {t}")
+    return 0
+
+
+def get_field(e, f):
+    cur = e
+    for part in f.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None, False
+    return cur, True
+
+
+def cmd_get(a):
+    st, idx = read_store()
+    path, node, via = resolve(idx, a.target)
+    if is_cat(node):
+        a.path, a.tree, a.all = a.target, False, False
+        return cmd_ls(a)
+    if superseded(node) and not a.history:
+        t = node["superseded_by"]
+        raise KBError(f"{path} is superseded by {t} ({idx.home.get(t, '?')}); use --history to read it")
+    if a.field:
+        v, ok = get_field(node, a.field)
+        if not ok:
+            raise KBError(f"{path} has no field {a.field}")
+        if isinstance(v, str):
+            out(v)
+        elif isinstance(v, list) and all(isinstance(x, str) for x in v):
+            for x in v:
+                out(x)
+        else:
+            out(json.dumps(v, sort_keys=True, ensure_ascii=False))
+        return 0
+    if a.json:
+        jout({"at": path, "via": via, "entry": node})
+        return 0
+    out(fmt_entry(idx, path, node, via if a.why else None, cache_load(), body=a.body))
+    return 0
+
+
+def links_of(idx, i):
+    e = idx.nodes[i]
+    outl = [(l["rel"], l["to"]) for l in e.get("links", []) if l.get("to") in idx.nodes]
+    inl = sorted((l["rel"], j) for j, o in idx.nodes.items() for l in o.get("links", []) if l.get("to") == i)
+    return sorted(outl), inl
+
+
+def cmd_links(a):
+    st, idx = read_store()
+    path, node, _ = resolve(idx, a.target)
+    if not is_entry(node):
+        raise KBError(f"{path} is a category; links apply to entries")
+    i = node["id"]
+    res = {"id": i, "path": path, "out": [], "in": [], "refs": [], "supersedes": [], "superseded_by": None}
+    lines = []
+
+    def label(j):
+        return f"{j}  {idx.home[j]}  {idx.nodes[j].get('title', '')}"
+
+    def walk(j, depth, seen):
+        o, _i = links_of(idx, j)
+        for rel, to in o:
+            lines.append("  " * depth + f"-> {rel}  {label(to)}")
+            if to not in seen and depth < a.depth:
+                walk(to, depth + 1, seen | {to})
+    o, inn = links_of(idx, i)
+    res["out"] = [{"rel": r, "id": t, "path": idx.home[t]} for r, t in o]
+    res["in"] = [{"rel": r, "id": t, "path": idx.home[t]} for r, t in inn]
+    res["refs"] = sorted(p.rsplit("/", 1)[0] for p, t, _ in idx.refs if t == i)
+    res["supersedes"] = sorted(node.get("supersedes", []))
+    res["superseded_by"] = node.get("superseded_by")
+    if a.json:
+        jout(res)
+        return 0
+    lines.append(f"{label(i)}")
+    walk(i, 1, {i})
+    for r, t in inn:
+        lines.append(f"<- {r}  {label(t)}")
+    for p in res["refs"]:
+        lines.append(f"ref  also listed under {p}")
+    for t in res["supersedes"]:
+        lines.append(f"supersedes  {label(t)}" if t in idx.nodes else f"supersedes  {t}")
+    if res["superseded_by"]:
+        t = res["superseded_by"]
+        lines.append(f"superseded by  {label(t)}" if t in idx.nodes else f"superseded by  {t}")
+    out("\n".join(lines))
+    return 0
+
+
+def flatten(e):
+    """(field, text) pairs for every string in an entry."""
+    res = []
+
+    def go(prefix, v):
+        if isinstance(v, str):
+            res.append((prefix, v))
+        elif isinstance(v, list):
+            for x in v:
+                go(prefix, x)
+        elif isinstance(v, dict):
+            for k in sorted(v):
+                go(f"{prefix}.{k}" if prefix else k, v[k])
+    go("", e)
+    return res
+
+
+def cmd_search(a):
+    st, idx = read_store()
+    if not (a.regex or a.commit or a.path_field):
+        raise KBError("search needs a REGEX, --commit or --path", 2)
+    try:
+        rx = re.compile(a.regex, re.I) if a.regex else None
+    except re.error as ex:
+        raise KBError(f"bad regex: {ex}", 2)
+    under = resolve(idx, a.under)[0] if a.under else None
+    hits = []
+    for i, p in idx.entries():
+        e = idx.nodes[i]
+        if under and not (p == under or p.startswith(under + "/")):
+            continue
+        if superseded(e) and not a.history:
+            continue
+        if a.type and e.get("type") != a.type:
+            continue
+        if a.status and e.get("status") != a.status:
+            continue
+        if a.commit and not any(c.startswith(a.commit) or a.commit.startswith(c) for c in e.get("commits", [])):
+            continue
+        if a.path_field:
+            vals = [e.get("path", "")] + [e.get("source", {}).get("path", "")] if isinstance(e.get("source"), dict) \
+                else [e.get("path", "")]
+            if not any(isinstance(v, str) and a.path_field in v for v in vals):
+                continue
+        snippets = []
+        if rx:
+            for f, text in flatten(e):
+                m = rx.search(text)
+                if m:
+                    if f.split(".")[0] == "body" and not a.body:
+                        snippets.append("")
+                        continue
+                    snippets.append(f"    {f}: …{text[max(m.start() - 50, 0):m.end() + 90]}…")
+            if not snippets:
+                continue
+        hits.append((p, e, snippets))
+    if not hits:
+        print("kb: no match (not recorded)", file=sys.stderr)
+        return 1
+    if a.json:
+        jout([{"path": p, "id": e["id"], "title": e.get("title")} for p, e, _ in hits])
+        return 0
+    for p, e, sn in hits:
+        out(f"{p}  {e.get('title', '')}")
+        for s in [x for x in sn if x][:2]:
+            out(s)
+    return 0
+
+
+# ---------------------------------------------------------------- ask and hot
+def stem(w):
+    if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+        w = w[:-1]
+    for suf in ("ing", "ed"):
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            w = w[:-len(suf)]
+            if len(w) > 3 and w[-1] == w[-2] and w[-1] not in "aeiouls":
+                w = w[:-1]
+            break
+    return w
+
+
+def toks(s):
+    return [stem(w) for w in re.findall(r"[a-z0-9]+", str(s).lower())]
+
+
+def tmatch(t, ws):
+    return any(w == t or (len(t) >= 3 and w.startswith(t)) or (len(w) >= 3 and t.startswith(w)) for w in ws)
+
+
+def ask_cands(idx, under):
+    """(path, node, kind) of every visible entry and every category, optionally under a path."""
+    for p, n, kind in all_nodes(idx):
+        if under and not (p == under or p.startswith(under + "/")):
+            continue
+        if kind == "entry" and not visible(n):
+            continue
+        yield p, n, kind
+
+
+def ask_rank(idx, q, under):
+    """Ranked word match: [(score, path, node)] best first; score = (tokens hit in title or name, tokens hit anywhere,
+    weighted fields hit); a match in the value alone ranks below any in title or name."""
+    ts = [t for t in toks(q) if t not in STOP]
+    res = []
+    for p, n, kind in ask_cands(idx, under):
+        title = toks(title_of(n) or "")
+        name = toks(p.rsplit("/", 1)[-1] + " " + " ".join(n.get("_aliases") or n.get("aliases") or []))
+        val = toks(n.get("value", "")) if kind == "entry" else []
+        m = w = head = 0
+        for t in ts:
+            th, nh, vh = tmatch(t, title), tmatch(t, name), tmatch(t, val)
+            if th or nh or vh:
+                m += 1
+                w += 2 * th + 3 * nh + vh
+                head += th or nh
+        if m:
+            res.append(((head, m, w - (kind == "category")), p, n))
+    res.sort(key=lambda r: (-r[0][0], -r[0][1], -r[0][2], r[1]))
+    return ts, res
+
+
+def ask_warnings(idx, path):
+    parts = path.split("/")
+    for k in range(len(parts), 0, -1):
+        w = "/".join(parts[:k]) + "/warnings"
+        n = idx.paths.get(w)
+        if n is not None and is_cat(n) and path != w:
+            c = count_visible(idx, n, False, False)
+            if c:
+                return f"warnings: {w} ({c})"
+    return None
+
+
+def ask_line(idx, path, e, cache):
+    parts = [path, e.get("value") or e.get("title", "")]
+    src = e.get("source")
+    if isinstance(src, dict) and src.get("path"):
+        parts.append(src["path"] + (":" + src["locator"] if src.get("locator") else ""))
+    if e.get("type") == "fact":
+        v = (cache or {}).get("local:" + str(e.get("id")))
+        parts.append("verified: " + (v[:10] if v else "-"))
+    o, inn = links_of(idx, e["id"])
+    rel = sorted({t for _, t in o} | {t for _, t in inn})
+    if rel:
+        parts.append("rel: " + ",".join(rel))
+    return " | ".join(parts)
+
+
+def cmd_ask(a):
+    q = " ".join(a.words).strip()
+    if not q:
+        raise KBError("ask needs WORDS", 2)
+    st, idx = read_store()
+    under = resolve(idx, a.under)[0] if a.under else None
+    key = re.sub(r"\s+", "-", q.lower())
+
+    def inside(p):
+        return not under or p == under or p.startswith(under + "/")
+
+    def shown(p):
+        n = idx.paths[p]
+        return inside(p) and (not is_entry(n) or visible(n))
+    win, cands = None, None
+    for hit in [[h[0] for h in idx.aliases.get(key, [])],
+                [idx.home[key]] if key in idx.nodes else [],
+                [key] if key in idx.paths and not is_ref(idx.paths[key]) else [],
+                [p for p, n, _ in ask_cands(idx, under) if (title_of(n) or "").strip().lower() == q.lower()]]:
+        hit = sorted(p for p in hit if p in idx.paths and shown(p))
+        if len(hit) == 1:
+            win = hit[0]
+            break
+        if hit:
+            cands = hit
+            break
+    ts = []
+    if win is None and cands is None:
+        ts, ranked = ask_rank(idx, q, under)
+        if not ranked:
+            nr = nearest(idx, [slug(q)], 0)
+            raise KBError(f"not found: {q} (not recorded)\n" + nr)
+        top = ranked[0]
+        weak = top[0][0] == 0 or top[0][1] < len(ts)
+        tie = len(ranked) > 1 and ranked[1][0][:2] == top[0][:2] and top[0][2] - ranked[1][0][2] < 3
+        if weak or tie:
+            cands = [r[1] for r in ranked[:5]]
+        else:
+            win = top[1]
+    if cands is not None:
+        if a.json:
+            jout({"match": "ambiguous", "candidates": [{"path": p, "title": title_of(idx.paths[p])} for p in cands[:5]]})
+        else:
+            out("AMBIGUOUS:")
+            for p in cands[:5]:
+                out(f"{p} | {title_of(idx.paths[p])}")
+        return 0
+    node = idx.paths[win]
+    warn = ask_warnings(idx, win)
+    if is_cat(node):
+        rows = [(k, line_for(idx, node, k, False, False)) for k in sort_children(node)]
+        rows = [(k, ln) for k, ln in rows if ln is not None]
+        if a.json:
+            jout({"match": "category", "at": win, "children": [{"name": k, "line": ln} for k, ln in rows], "warnings": warn})
+        else:
+            out(f"at: {win}/")
+            for _, ln in rows:
+                out(ln)
+            if warn:
+                out(warn)
+        return 0
+    if a.json:
+        jout({"match": "entry", "at": win, "entry": node, "warnings": warn})
+        return 0
+    out(ask_line(idx, win, node, cache_load()))
+    if a.body:
+        for b in node.get("body", []):
+            out(b)
+    if warn:
+        out(warn)
+    return 0
+
+
+HOT_HELP = ["kb ask WORDS first: one call (alias, id, title, then ranked words)",
+            "kb ls PATH to browse; kb find WORDS or kb search REGEX to look wider",
+            "kb get PATH --body for detail (default output has no body)",
+            "kb add PATH --type T --title ... to record (kb add --help)"]
+
+
+def hot_sheet(idx):
+    hot = []
+    for i, p in idx.entries():
+        e = idx.nodes[i]
+        if e.get("hot") is True and not superseded(e) and e.get("aliases") and isinstance(e.get("value"), str):
+            hot.append((e["aliases"][0], e["value"]))
+    body = "\n".join([f"{al}={v}" for al, v in sorted(hot)] + HOT_HELP) + "\n"
+    return f"HOT {hashlib.sha256(body.encode()).hexdigest()[:8]}\n" + body, len(hot)
+
+
+def cmd_hot(a):
+    st, idx = read_store()
+    text, n = hot_sheet(idx)
+    if len(text) > HOT_CHARS:
+        print(f"kb: hot sheet is {len(text)} chars (limit {HOT_CHARS}); un-mark some hot entries", file=sys.stderr)
+    print(text, end="")
+    return 0
+
+
+# ---------------------------------------------------------------- write commands
+def parse_kv(items):
+    res = {}
+    for it in items or []:
+        if "=" not in it:
+            raise KBError(f"--field wants KEY=VALUE, got {it!r}", 2)
+        k, v = it.split("=", 1)
+        try:
+            val = json.loads(v)
+        except ValueError:
+            val = v
+        cur = res
+        parts = k.split(".")
+        for p in parts[:-1]:
+            cur = cur.setdefault(p, {})
+        cur[parts[-1]] = val
+    return res
+
+
+def deep_set(dst, src):
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            deep_set(dst[k], v)
+        else:
+            dst[k] = v
+
+
+def words(s):
+    return {w for w in re.findall(r"[a-z0-9]+", s.lower()) if len(w) >= 3}
+
+
+def uniq_id(idx, base):
+    base = slug(base)
+    i, n = base, 2
+    while i in idx.nodes or i in idx.aliases or ("/" not in i and i in idx.paths):
+        i, n = f"{base}-{n}", n + 1
+    return i
+
+
+def get_cat(idx, path):
+    n = idx.paths.get(path)
+    if n is None or not is_cat(n):
+        parts = path.split("/") if path else []
+        k = 0
+        while k < len(parts) and "/".join(parts[:k + 1]) in idx.paths:
+            k += 1
+        raise KBError(f"no category {path} (create it with: kb mkcat {path} --title T)\n" + nearest(idx, parts, k))
+    return n
+
+
+def split_path(p):
+    parts = p.strip("/").split("/")
+    if len(parts) < 2 or not all(parts):
+        raise KBError("PATH must be topic/.../name", 2)
+    return "/".join(parts[:-1]), parts[-1]
+
+
+def build_entry(a, idx, name):
+    t = a.type
+    e = {"type": t, "title": a.title, "updated": today()}
+    e["id"] = a.id or uniq_id(idx, name)
+    if a.value is not None:
+        e["value"] = a.value
+    if a.body:
+        e["body"] = list(a.body)
+    if a.alias:
+        e["aliases"] = list(a.alias)
+    if a.commit:
+        e["commits"] = list(a.commit)
+    if a.link:
+        e["links"] = []
+        for l in a.link:
+            rel, _, to = l.partition("=")
+            e["links"].append({"rel": rel, "to": to})
+    if a.since:
+        e["since"] = a.since
+    if t == "fact":
+        if a.probe is not None:
+            e["probe"] = {"cmd": a.probe}
+            if a.probe_timeout:
+                e["probe"]["timeout"] = a.probe_timeout
+        elif a.probe_none is not None:
+            e["probe"] = {"none": a.probe_none}
+        if a.source_path is not None:
+            e["source"] = {"path": a.source_path, "locator": a.source_locator or ""}
+    elif t == "item":
+        if a.kind and a.kind not in ITEM_KINDS:
+            raise KBError(f"item kind must be one of {', '.join(ITEM_KINDS)}", 2)
+        e.update(status=a.status or "open", opened=a.opened or today(), closed=None, priority=a.priority)
+        if a.kind:
+            e["kind"] = a.kind
+        if a.seq is not None:
+            e["seq"] = a.seq
+    elif t == "decision":
+        e["date"] = a.date or today()
+        e["status"] = a.status or "accepted"
+        if a.decision:
+            e["decision"] = a.decision
+    elif t == "procedure":
+        e["thresholds"] = {}
+        if a.step:
+            e["steps"] = list(a.step)
+    elif t in ("warning", "context"):
+        if a.scenario:
+            e["scenario"] = a.scenario
+        if t == "warning":
+            if a.kind:
+                e["kind"] = a.kind
+            if a.steps is not None:
+                e["steps"] = a.steps
+            if a.noise:
+                e["noise"] = a.noise
+            if a.shortcut:
+                e["shortcut"] = a.shortcut
+    elif t == "artifact":
+        pass
+    deep_set(e, parse_kv(a.field))
+    return e
+
+
+def place_item(idx, e):
+    """Give a new item the seq that keeps the backlog in state.sh order (kind, priority, opened, id): it goes before
+    the first existing item that sorts after it, and later items shift by one; otherwise it is appended."""
+    items = sorted((n for n in idx.nodes.values() if n.get("type") == "item" and isinstance(n.get("seq"), int)),
+                   key=lambda n: (n["seq"], n["id"]))
+    k = item_sort_key(e)
+    after = next((n for n in items if item_sort_key(n) > k), None)
+    if after is None:
+        e["seq"] = items[-1]["seq"] + 1 if items else 1
+        return
+    e["seq"] = after["seq"]
+    for n in items:
+        if n["seq"] >= e["seq"]:
+            n["seq"] += 1
+
+
+def cmd_add(a):
+    parent_path, name = split_path(a.path)
+
+    def fn(st, idx):
+        cat = get_cat(idx, parent_path)
+        if name in cat:
+            raise KBError(f"{a.path} already exists (use kb set)")
+        if not NAME.fullmatch(name) or name == "type":
+            raise KBError(f"name {name!r} must match [a-z0-9][a-z0-9-]*", 2)
+        if a.id and a.id in idx.nodes:
+            raise KBError(f"id {a.id} already exists at {idx.home[a.id]}")
+        e = build_entry(a, idx, name)
+        if e["type"] == "item" and "seq" not in e:
+            place_item(idx, e)
+        topic = parent_path.split("/")[0]
+        mine = words(e["title"] + " " + e.get("value", ""))
+        near = []
+        for i, p in idx.entries():
+            if p.split("/")[0] != topic or superseded(idx.nodes[i]):
+                continue
+            o = words(idx.nodes[i].get("title", "") + " " + idx.nodes[i].get("value", ""))
+            if mine and o and mine & o:
+                near.append((len(mine & o) / len(mine | o), p, idx.nodes[i].get("title", "")))
+        near.sort(key=lambda x: (-x[0], x[1]))
+        if near:
+            print("nearest entries in " + topic + ":")
+            for s, p, t in near[:5]:
+                print(f"  {s:.2f}  {p}  {t}")
+        if near and near[0][0] >= 0.5 and not a.dup_ok:
+            raise KBError("looks like a duplicate of " + near[0][1] + "; use kb set on it, or add --dup-ok")
+        cat[name] = e
+        return e["id"]
+    i = mutate(fn)
+    out(f"added {a.path} (id {i})")
+    return 0
+
+
+def cmd_mkcat(a):
+    parts = a.path.strip("/").split("/")
+
+    def fn(st, idx):
+        cur = None
+        for k, p in enumerate(parts):
+            path = "/".join(parts[:k + 1])
+            if not NAME.fullmatch(p):
+                raise KBError(f"name {p!r} must match [a-z0-9][a-z0-9-]*", 2)
+            if k == 0:
+                if p not in st.topics:
+                    if k == len(parts) - 1:
+                        st.topics[p] = {"_schema": SCHEMA, "_title": a.title}
+                    else:
+                        raise KBError(f"topic {p} does not exist (create it first: kb mkcat {p} --title T)")
+                elif k == len(parts) - 1:
+                    raise KBError(f"{path} already exists")
+                cur = st.topics[p]
+            else:
+                if p in cur:
+                    if k == len(parts) - 1:
+                        raise KBError(f"{path} already exists")
+                    if not is_cat(cur[p]):
+                        raise KBError(f"{path} is not a category")
+                elif k == len(parts) - 1:
+                    cur[p] = {"_title": a.title}
+                else:
+                    raise KBError(f"category {path} does not exist")
+                cur = cur[p]
+        if a.alias:
+            cur["_aliases"] = sorted(set(cur.get("_aliases", [])) | set(a.alias))
+    mutate(fn, create=True)
+    out(f"created {a.path}/")
+    return 0
+
+
+def frozen_check(old, new):
+    if old.get("type") == "decision":
+        bad = sorted(k for k in set(old) | set(new) if k not in DECISION_MUTABLE and old.get(k) != new.get(k))
+        if bad:
+            raise KBError("decisions are frozen after recording; only status (and links, aliases, commits) may change: "
+                          + ", ".join(bad))
+
+
+def cmd_set(a):
+    def fn(st, idx):
+        path, node, _ = resolve(idx, a.target)
+        if is_cat(node):
+            other = [n for n in ("value", "body", "add_body", "commit", "status", "probe", "probe_timeout", "probe_none",
+                                 "source_path", "source_locator", "field", "unset") if getattr(a, n)]
+            if other:
+                raise KBError(f"a category only takes --title, --alias and --unalias (not --{other[0].replace('_', '-')})", 2)
+            if a.title:
+                node["_title"] = a.title
+            if a.alias:
+                node["_aliases"] = sorted(set(node.get("_aliases", [])) | set(a.alias))
+            if a.unalias:
+                node["_aliases"] = sorted(set(node.get("_aliases", [])) - set(a.unalias))
+                if not node["_aliases"]:
+                    del node["_aliases"]
+            return path
+        old = copy.deepcopy(node)
+        if a.title is not None:
+            node["title"] = a.title
+        if a.value is not None:
+            node["value"] = a.value
+        if a.body is not None:
+            node["body"] = list(a.body)
+        if a.add_body:
+            node["body"] = list(node.get("body", [])) + list(a.add_body)
+        if a.alias:
+            node["aliases"] = sorted(set(node.get("aliases", [])) | set(a.alias))
+        if a.unalias:
+            node["aliases"] = sorted(set(node.get("aliases", [])) - set(a.unalias))
+        if a.commit:
+            node["commits"] = sorted(set(node.get("commits", [])) | set(a.commit))
+        if a.status is not None:
+            node["status"] = a.status
+        if a.probe is not None:
+            node["probe"] = {"cmd": a.probe}
+            if a.probe_timeout:
+                node["probe"]["timeout"] = a.probe_timeout
+        elif a.probe_timeout and isinstance(node.get("probe"), dict) and "cmd" in node["probe"]:
+            node["probe"]["timeout"] = a.probe_timeout
+        if a.probe_none is not None:
+            node["probe"] = {"none": a.probe_none}
+        if a.source_path is not None or a.source_locator is not None:
+            src = dict(node.get("source") or {"path": "", "locator": ""})
+            if a.source_path is not None:
+                src["path"] = a.source_path
+            if a.source_locator is not None:
+                src["locator"] = a.source_locator
+            node["source"] = src
+        deep_set(node, parse_kv(a.field))
+        for k in a.unset or []:
+            if k in ("id", "type"):
+                raise KBError(f"{k} cannot be unset")
+            *parents, leaf = k.split(".")
+            cur = node
+            for seg in parents:
+                cur = cur.get(seg) if isinstance(cur, dict) else None
+            if isinstance(cur, dict):
+                cur.pop(leaf, None)
+        if node == old:
+            raise KBError("nothing to change (give at least one option)", 2)
+        frozen_check(old, node)
+        if node.get("id") != old.get("id"):
+            raise KBError("id is immutable")
+        node["updated"] = today()
+        return path
+    p = mutate(fn)
+    out(f"updated {p}")
+    return 0
+
+
+def cmd_close(a):
+    def fn(st, idx):
+        path, node, _ = resolve(idx, a.target)
+        if not (is_entry(node) and node.get("type") == "item"):
+            raise KBError(f"{path} is not an item (use kb set --status for other types)")
+        d = a.date or today()
+        if not isdate(d):
+            raise KBError("bad date", 2)
+        node["status"], node["closed"], node["updated"] = "done", d, today()
+        return path
+    out(f"closed {mutate(fn)}")
+    return 0
+
+
+def cmd_link(a):
+    if a.rel not in RELS:
+        raise KBError(f"rel must be one of {', '.join(RELS)}", 2)
+
+    def fn(st, idx):
+        pa, na, _ = resolve(idx, a.a)
+        pb, nb, _ = resolve(idx, a.b)
+        if not (is_entry(na) and is_entry(nb)):
+            raise KBError("link joins two entries")
+        link = {"rel": a.rel, "to": nb["id"]}
+        links = list(na.get("links", []))
+        if a.remove:
+            if link not in links:
+                raise KBError("no such link")
+            links.remove(link)
+        elif link in links:
+            raise KBError("link already exists")
+        else:
+            links.append(link)
+        links.sort(key=lambda l: (l["rel"], l["to"]))
+        if links:
+            na["links"] = links
+        else:
+            na.pop("links", None)
+        na["updated"] = today()
+        return pa, pb
+    pa, pb = mutate(fn)
+    out(f"{'unlinked' if a.remove else 'linked'} {pa} {a.rel} {pb}")
+    return 0
+
+
+def cmd_ref(a):
+    def fn(st, idx):
+        path, node, _ = resolve(idx, a.id)
+        if not is_entry(node):
+            raise KBError("ref needs an entry")
+        cat = get_cat(idx, a.at.strip("/"))
+        key = path.rsplit("/", 1)[-1]
+        if a.remove:
+            hit = [k for k in child_names(cat) if is_ref(cat[k]) and cat[k]["$ref"] == node["id"]]
+            if not hit:
+                raise KBError(f"no ref to {node['id']} at {a.at}")
+            for k in hit:
+                del cat[k]
+            return "removed ref", path
+        if path.rsplit("/", 1)[0] == a.at.strip("/"):
+            raise KBError(f"{a.at} is the home category of {node['id']}")
+        if any(is_ref(cat[k]) and cat[k]["$ref"] == node["id"] for k in child_names(cat)):
+            raise KBError(f"{a.at} already refs {node['id']}")
+        k, n = key, 2
+        while k in cat:
+            k, n = f"{key}-{n}", n + 1
+        cat[k] = {"$ref": node["id"]}
+        return "added ref", path
+    verb, path = mutate(fn)
+    out(f"{verb} to {path} at {a.at}")
+    return 0
+
+
+def cmd_supersede(a):
+    def fn(st, idx):
+        po, old, _ = resolve(idx, a.old)
+        pn, new, _ = resolve(idx, a.new)
+        if not (is_entry(old) and is_entry(new)):
+            raise KBError("supersede joins two entries")
+        if old is new:
+            raise KBError("an entry cannot supersede itself")
+        if old.get("superseded_by"):
+            raise KBError(f"{po} is already superseded by {old['superseded_by']}")
+        d = today()
+        old["until"], old["superseded_by"], old["updated"] = d, new["id"], d
+        new["supersedes"] = sorted(set(new.get("supersedes", [])) | {old["id"]})
+        new.setdefault("since", d)
+        new["updated"] = d
+        return po, pn
+    po, pn = mutate(fn)
+    out(f"{po} superseded by {pn}")
+    return 0
+
+
+def cmd_mv(a):
+    src, dst = a.path.strip("/"), a.newpath.strip("/")
+
+    def fn(st, idx):
+        if src not in idx.paths:
+            resolve(idx, src)
+            raise KBError(f"mv takes a path, got {src}")
+        node = idx.paths[src]
+        if dst == src or dst.startswith(src + "/"):
+            raise KBError("cannot move into itself")
+        if dst in idx.paths:
+            raise KBError(f"{dst} already exists")
+        dname = dst.rsplit("/", 1)[-1]
+        if not NAME.fullmatch(dname) or dname == "type":
+            raise KBError(f"name {dname!r} must match [a-z0-9][a-z0-9-]*", 2)
+        if ("/" in src) != ("/" in dst):
+            raise KBError("a topic can only be renamed to a topic; entries and categories move under a category")
+        if "/" not in src:
+            st.topics[dst] = st.topics.pop(src)
+            return
+        dcat = get_cat(idx, dst.rsplit("/", 1)[0])
+        scat = idx.paths[src.rsplit("/", 1)[0]]
+        dcat[dname] = scat.pop(src.rsplit("/", 1)[1])
+    mutate(fn)
+    out(f"moved {src} -> {dst}")
+    return 0
+
+
+def subtree_ids(node):
+    if is_entry(node):
+        return {node["id"]}
+    ids = set()
+    if is_cat(node):
+        for k in child_names(node):
+            ids |= subtree_ids(node[k])
+    return ids
+
+
+def cmd_rm(a):
+    target = a.path.strip("/")
+
+    def fn(st, idx):
+        nonlocal target
+        if target not in idx.paths:
+            target = resolve(idx, target)[0]
+        node = idx.paths[target]
+        gone = subtree_ids(node)
+        if is_cat(node) and child_names(node) and not a.force:
+            raise KBError(f"{target} is not empty; use --force to remove it and everything in it")
+        blockers = []
+        inside = lambda p: p == target or p.startswith(target + "/")
+        for i, p in idx.entries():
+            if inside(p):
+                continue
+            e = idx.nodes[i]
+            for l in e.get("links", []):
+                if l.get("to") in gone:
+                    blockers.append(f"{p} links {l['rel']} -> {l['to']}")
+            if e.get("superseded_by") in gone:
+                blockers.append(f"{p} is superseded by {e['superseded_by']}")
+            for s in e.get("supersedes", []):
+                if s in gone:
+                    blockers.append(f"{p} supersedes {s}")
+        for p, t, _ in idx.refs:
+            if t in gone and not inside(p):
+                blockers.append(f"{p} refs {t}")
+        if blockers and not a.force:
+            raise KBError("still referenced (use --force to remove anyway):\n  " + "\n  ".join(sorted(blockers)))
+        if is_ref(node) or "/" in target:
+            parent = idx.paths[target.rsplit("/", 1)[0]]
+            del parent[target.rsplit("/", 1)[1]]
+        else:
+            del st.topics[target]
+        # clean what pointed at the removed entries
+        idx2 = build_index(st, [])
+        for p, t, _ in idx2.refs:
+            if t in gone:
+                del idx2.paths[p.rsplit("/", 1)[0]][p.rsplit("/", 1)[1]]
+        for i, e in idx2.nodes.items():
+            if "links" in e:
+                e["links"] = [l for l in e["links"] if l.get("to") not in gone]
+                if not e["links"]:
+                    del e["links"]
+            if e.get("superseded_by") in gone:
+                for k in ("superseded_by", "until"):
+                    e.pop(k, None)
+            if "supersedes" in e:
+                e["supersedes"] = [s for s in e["supersedes"] if s not in gone]
+                if not e["supersedes"]:
+                    del e["supersedes"]
+        return len(gone)
+    n = mutate(fn)
+    out(f"removed {target}" + (f" ({n} entries)" if n != 1 else ""))
+    return 0
+
+
+def cmd_edit(a):
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
+    if not editor:
+        raise KBError("set $EDITOR to edit")
+
+    def fn(st, idx):
+        path, node, _ = resolve(idx, a.target)
+        view = {k: node[k] for k in ("_title", "_aliases") if k in node} if is_cat(node) else node
+        fd, tmp = tempfile.mkstemp(suffix=".json", prefix="kb-edit-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(dumps(view))
+            rc = subprocess.run(shlex.split(editor) + [tmp]).returncode
+            if rc != 0:
+                raise KBError(f"editor exited {rc}; nothing changed")
+            with open(tmp, encoding="utf-8") as f:
+                new = json.load(f)
+        except ValueError as ex:
+            raise KBError(f"edit rejected: not valid JSON ({ex}); nothing changed")
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+        if not isinstance(new, dict):
+            raise KBError("edit rejected: must stay an object")
+        if new == view:
+            raise KBError("no change")
+        if is_cat(node):
+            if set(new) - {"_title", "_aliases"}:
+                raise KBError("edit rejected: a category edit may only hold _title and _aliases")
+            for k in ("_title", "_aliases"):
+                node.pop(k, None)
+            node.update(new)
+            return path
+        if new.get("id") != node.get("id"):
+            raise KBError("edit rejected: id is immutable")
+        frozen_check(node, new)
+        if new.get("updated") == node.get("updated"):
+            new["updated"] = today()
+        node.clear()
+        node.update(new)
+        return path
+    out(f"edited {mutate(fn)}")
+    return 0
+
+
+# ---------------------------------------------------------------- check commands
+def selected_facts(idx, target):
+    if target:
+        path, node, _ = resolve(idx, target)
+    else:
+        path, node = None, None
+    res = []
+    for i, p in idx.entries():
+        e = idx.nodes[i]
+        if e.get("type") != "fact" or superseded(e):
+            continue
+        if path and not (p == path or p.startswith(path + "/")):
+            continue
+        res.append((p, e))
+    return res
+
+
+def cmd_probe(a):
+    if a.ssh and a.ssh.startswith("-"):
+        raise KBError(f"--ssh HOST must not start with '-': {a.ssh}", 2)
+    st, idx = read_store()
+    target = a.path or a.cat
+    facts = selected_facts(idx, target)
+    if target and not facts and not a.json:
+        print(f"kb: no facts under {target}", file=sys.stderr)
+    stale = parse_age(a.stale) if a.stale else None
+    cache = cache_load()
+    host = a.ssh or "local"
+    now = utcnow()
+    results = []
+    todo = []
+    for p, e in facts:
+        pr = e.get("probe")
+        key = f"{host}:{e['id']}"
+        if not isinstance(pr, dict) or "cmd" not in pr:
+            reason = pr.get("none") if isinstance(pr, dict) else "no probe recorded"
+            results.append({"path": p, "id": e["id"], "status": "unchecked", "detail": f"Probe: none ({reason})"})
+        elif stale is not None and verified_age(cache, key, now) is not None and verified_age(cache, key, now) < stale:
+            results.append({"path": p, "id": e["id"], "status": "fresh", "detail": f"verified {cache[key]}"})
+        else:
+            todo.append((p, e, key))
+    if todo:
+        pf = probe_facts()
+        try:
+            res = pf.run_probes([e["probe"]["cmd"] for _, e, _ in todo], a.ssh, a.budget,
+                                [e["probe"].get("timeout") for _, e, _ in todo])
+        except Exception as ex:
+            if type(ex).__name__ != "ShfmtMissing":
+                raise
+            res = [("unchecked", "shfmt not installed")] * len(todo)
+        add, drop = {}, []
+        for (p, e, key), (status, detail) in zip(todo, res):
+            st_ = {"ok": "ok", "fail": "fail", "unchecked": "unchecked"}[status]
+            if st_ == "ok":
+                add[key] = iso(now)
+            elif st_ == "fail":
+                drop.append(key)
+            results.append({"path": p, "id": e["id"], "status": st_, "detail": detail or e["probe"]["cmd"],
+                            "cmd": e["probe"]["cmd"], "locator": (e.get("source") or {}).get("locator", "")})
+        if add or drop:
+            try:
+                cache_update(add, drop)
+            except OSError as ex:
+                print(f"kb: warning: cannot write verified cache: {ex}", file=sys.stderr)
+    results.sort(key=lambda r: r["path"])
+    counts = {s: sum(1 for r in results if r["status"] == s) for s in ("ok", "fail", "unchecked", "fresh")}
+    if a.json:
+        jout({"results": results, "counts": counts})
+    else:
+        for r in results:
+            if r["status"] == "fail":
+                out(f"FAIL {r['path']} `{r.get('cmd', '')}` -> {r['detail']}")
+            elif r["status"] == "unchecked":
+                out(f"UNCHECKED {r['path']} -> {r['detail']}")
+            elif a.verbose:
+                out(f"{'ok' if r['status'] == 'ok' else 'fresh'} {r['path']}")
+        out(f"probe: {counts['ok']} ok, {counts['fail']} failed, {counts['unchecked']} unchecked, "
+            f"{counts['fresh']} fresh (skipped)")
+    return 1 if counts["fail"] else 0
+
+
+def cmd_validate(a):
+    d = data_dir()
+    st = load(d)
+    errs, warns = validate(st, orphans=a.orphans)
+    if a.json:
+        jout({"errors": errs, "warnings": warns})
+    else:
+        for e in errs:
+            out(f"kb: {e}")
+        for w in warns:
+            out(f"kb: warning: {w}")
+        if not errs:
+            idx = build_index(st, [])
+            out(f"kb: ok ({len(idx.nodes)} entries, {len(idx.cats)} categories)")
+    return 1 if errs else 0
+
+
+def cmd_fmt(a):
+    d = data_dir()
+    if not os.path.isdir(d):
+        raise KBError(f"no store at {d}")
+    if not a.check:
+        check_writable(d)
+    with locked(d):
+        st = load(d)
+        if st.problems:
+            for p in st.problems:
+                print(f"kb: {p}", file=sys.stderr)
+            return 1
+        diff = []
+        for t in sorted(st.topics):
+            p = os.path.join(d, t + ".json")
+            want = dumps(st.topics[t])
+            with open(p, encoding="utf-8") as f:
+                have = f.read()
+            if have != want:
+                diff.append(t + ".json")
+                if not a.check:
+                    atomic_write(p, want)
+    if a.check:
+        for t in diff:
+            out(f"kb: {t} is not formatted (run: kb fmt)")
+        return 1 if diff else 0
+    for t in diff:
+        out(f"formatted {t}")
+    return 0
+
+
+def cmd_render(a):
+    st, idx = read_store()
+    if a.open:
+        items = sorted((n for n in idx.nodes.values() if n.get("type") == "item" and n.get("status") != "done"),
+                       key=lambda n: (n.get("seq", 0), n["id"]))
+        me = SELF.replace(os.path.expanduser("~"), "~", 1)
+        out(f"## Open items ({data_dir().replace(os.path.expanduser('~'), '~', 1)})")
+        for n in items:
+            if n.get("kind") != "backlog":
+                out(f"- [{n.get('kind')}] {n.get('opened')} {n['id']}: {n.get('title')}")
+        b = [n for n in items if n.get("kind") == "backlog"]
+        if b:
+            out(f"Backlog: {len(b)} open; top: " + "; ".join(n.get("title", "") for n in b[:3]))
+        if not items:
+            out("(none)")
+        out(f"Detail: {me} get <id>. Decisions and pitfalls: {me} ls setup.")
+        return 0
+    if not a.cat:
+        raise KBError("render needs --open or --cat C", 2)
+    path, node, _ = resolve(idx, a.cat)
+    if is_entry(node):
+        raise KBError(f"{path} is an entry; render takes a category")
+    lines = []
+
+    def bullet(e):
+        text = e.get("value") or e.get("title", "")
+        pr = e.get("probe")
+        if isinstance(pr, dict) and "cmd" in pr:
+            text += f" Probe: `{pr['cmd']}`"
+        elif isinstance(pr, dict):
+            text += f" Probe: none ({pr.get('none')})"
+        return text
+
+    def go(cat, p, depth):
+        for k in sort_children(cat):
+            n = cat[k]
+            if is_ref(n):
+                n = idx.nodes.get(n["$ref"])
+                if n is None:
+                    continue
+            if is_cat(n):
+                lines.append(("#" * min(depth + 1, 6) + " " + n.get("_title", k)) if a.md else f"{p}/{k}/  {n.get('_title', '')}")
+                if a.md:
+                    lines.append("")
+                go(n, p + "/" + k, depth + 1)
+            elif visible(n, a.history, False):
+                lines.append(("- " + bullet(n)) if a.md else f"{p}/{k}: {bullet(n)}")
+        if a.md and lines and lines[-1] != "":
+            lines.append("")
+    if a.md:
+        lines.append("# " + node.get("_title", path))
+        lines.append("")
+    go(node, path, 1)
+    out("\n".join(lines).rstrip("\n"))
+    return 0
+
+
+# ---------------------------------------------------------------- migration
+def item_sort_key(it):
+    return (KIND_RANK.get(it.get("kind"), 3), it.get("priority") or 0, it.get("opened") or "", it.get("id") or "")
+
+
+def ensure_cats(st, path, titles):
+    parts = path.split("/")
+    if parts[0] not in st.topics:
+        st.topics[parts[0]] = {"_schema": SCHEMA, "_title": titles.get(parts[0]) or parts[0].replace("-", " ").title()}
+    cur = st.topics[parts[0]]
+    for k in range(1, len(parts)):
+        p = "/".join(parts[:k + 1])
+        if parts[k] not in cur:
+            cur[parts[k]] = {"_title": titles.get(p) or parts[k].replace("-", " ").title()}
+        elif not is_cat(cur[parts[k]]):
+            raise KBError(f"{p} is not a category")
+        cur = cur[parts[k]]
+    return cur
+
+
+def cmd_import_state(a):
+    try:
+        with open(a.file, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as ex:
+        raise KBError(f"cannot read {a.file}: {ex}")
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        raise KBError('state file must be {"items": [...]}')
+    items = data["items"]
+    if not all(isinstance(i, dict) for i in items):
+        raise KBError("every item must be an object")
+    ordered = sorted(items, key=item_sort_key)
+
+    known = {"id", "kind", "title", "detail", "area", "priority", "opened", "closed", "status"}
+    for it in items:
+        extra = sorted(set(it) - known)
+        if extra:
+            raise KBError(f"item {it.get('id')!r} has keys kb items do not keep: {', '.join(extra)}; nothing written")
+
+    def fn(st, idx):
+        cat = ensure_cats(st, a.cat, {"setup": "Setup and process", a.cat: "Open items and backlog"})
+        old = {k: cat[k] for k in child_names(cat) if is_entry(cat[k]) and cat[k].get("type") == "item"}
+        if old and not a.replace:
+            raise KBError(f"{a.cat} already holds items; use --replace to overwrite them")
+        gone = {n["id"] for n in old.values() if isinstance(n.get("id"), str)} - {it.get("id") for it in ordered}
+        if gone:
+            idx0 = build_index(st, [])
+            blockers = []
+            for i, pth in idx0.entries():
+                e = idx0.nodes[i]
+                if i in gone:
+                    continue
+                blockers += [f"{pth} links {l['rel']} -> {l['to']}" for l in e.get("links", []) if l.get("to") in gone]
+                blockers += [f"{pth} supersede pointer to {x}" for x in [e.get("superseded_by")] + e.get("supersedes", [])
+                             if x in gone]
+            blockers += [f"{pth} refs {t}" for pth, t, _ in idx0.refs if t in gone]
+            if blockers:
+                raise KBError("--replace would orphan references to items the import does not restore:\n  "
+                              + "\n  ".join(sorted(blockers)))
+        for k in old:
+            del cat[k]
+        idx = build_index(st, [])
+        for seq, it in enumerate(ordered, 1):
+            i = it.get("id")
+            if not isinstance(i, str) or not NAME.fullmatch(i):
+                raise KBError(f"item id {i!r} must be a slug")
+            if i in idx.nodes:
+                raise KBError(f"id {i} already exists at {idx.home[i]}")
+            e = {"id": i, "type": "item", "title": it.get("title"), "body": str(it.get("detail", "")).split("\n"),
+                 "kind": it.get("kind"), "status": it.get("status"), "seq": seq, "priority": it.get("priority"),
+                 "opened": it.get("opened"), "closed": it.get("closed"), "area": it.get("area"),
+                 "updated": it.get("closed") or it.get("opened") or today()}
+            cat[i] = e
+            idx.nodes[i], idx.home[i] = e, f"{a.cat}/{i}"
+        return len(ordered)
+    n = mutate(fn, create=True)
+    out(f"imported {n} items under {a.cat}")
+    return 0
+
+
+def cmd_export_state(a):
+    st, idx = read_store()
+    ents = sorted((e for e in idx.nodes.values() if e.get("type") == "item"), key=lambda e: (e.get("seq", 0), e["id"]))
+    items = [{"id": e["id"], "kind": e.get("kind"), "title": e.get("title"), "detail": "\n".join(e.get("body", [])),
+              "area": e.get("area") or "setup", "priority": e.get("priority"), "opened": e.get("opened"),
+              "closed": e.get("closed"), "status": e.get("status")} for e in ents]
+    text = json.dumps({"items": items}, indent=2, ensure_ascii=False) + "\n"
+    if a.out:
+        atomic_write(a.out, text)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+NONE_END = re.compile(r"Probe: none \((.*)\)\s*$")
+
+
+def find_probe(segs):
+    """The probe of a bullet, by probe-facts.py's rule (its PROBE regex), the first physical line first so a
+    continuation line's own Probe: never replaces the parent's. Returns (seg index, match, cmd, none-reason) or None."""
+    pf = probe_facts()
+    none_any = re.compile(r"Probe: none \(([^)]+)\)")
+    for i, seg in enumerate(segs):
+        m = pf.PROBE.search(seg)
+        if m:
+            return i, m, m.group(1), None
+        m = NONE_END.search(seg) or none_any.search(seg)
+        if m:
+            return i, m, None, m.group(1)
+    return None
+
+
+def cmd_import_facts(a):
+    try:
+        lines = open(a.file, encoding="utf-8").read().split("\n")
+    except OSError as ex:
+        raise KBError(f"cannot read {a.file}: {ex}")
+    bullets, cur = [], None
+    for n, line in enumerate(lines, 1):
+        if line.startswith("- "):
+            cur = [n, [line[2:].rstrip()]]
+            bullets.append(cur)
+        elif cur and line.startswith((" ", "\t")) and line.strip():
+            cur[1].append(line.strip())
+        else:
+            cur = None
+    parsed, missing = [], []
+    for n, segs in bullets:
+        hit = find_probe(segs)
+        if not hit:
+            missing.append(f"{a.file}:{n}: bullet has no Probe: `cmd` or Probe: none (reason)")
+            continue
+        i, m, cmd, none = hit
+        segs = list(segs)
+        segs[i] = segs[i][:m.start()] + " " + segs[i][m.end():]
+        value = re.sub(r"\s+", " ", " ".join(segs)).strip()
+        parsed.append((n, value, cmd, none))
+    if missing:
+        raise KBError("\n".join(missing) + "\nnothing imported")
+    try:
+        src = os.path.relpath(os.path.realpath(a.file), REPO)
+        if src.startswith(".."):
+            src = a.file
+    except ValueError:
+        src = a.file
+
+    def fn(st, idx):
+        cat = ensure_cats(st, a.cat, {})
+        idx = build_index(st, [])
+        made = 0
+        for n, value, cmd, none in parsed:
+            if not value:
+                raise KBError(f"{a.file}:{n}: empty fact text")
+            title = value if len(value) <= 80 else value[:80].rsplit(" ", 1)[0] if " " in value[:80] else value[:80]
+            title = title.rstrip(" ,;:-")
+            base = slug(" ".join(re.findall(r"[A-Za-z0-9]+", value)[:6]), 40)
+            key, k = base, 2
+            while key in cat:
+                key, k = f"{base}-{k}", k + 1
+            i = uniq_id(idx, key)
+            e = {"id": i, "type": "fact", "title": title, "value": value, "updated": today(),
+                 "probe": {"cmd": cmd} if cmd else {"none": none},
+                 "source": {"path": src, "locator": f"bullet at line {n}"}}
+            cat[key] = e
+            idx.nodes[i], idx.home[i] = e, f"{a.cat}/{key}"
+            made += 1
+        return made
+    n = mutate(fn, create=True)
+    out(f"imported {n} facts under {a.cat}")
+    return 0
+
+
+# ---------------------------------------------------------------- CLI
+def types_help():
+    rows = ["Entry types (required fields; common to all: id, type, title <= 100 chars, updated; optional: value,",
+            "body[], aliases[], links[{rel,to}], commits[], since/until/superseded_by, hot (bool: on the hot sheet; needs an "
+            "alias and a value; kb set ID --field hot=true --alias A)):", ""]
+    for t in sorted(TYPES):
+        rows.append(f"  {t:<11} {TYPES[t][1]}")
+    rows += ["", f"link rels: {', '.join(RELS)}",
+             "Defaults filled by add: id (slug of the last path segment, unique store-wide), updated; item: status open, "
+             "opened today, closed null, seq placed in state.sh order (user-action, waiting, backlog by priority, then opened, id; "
+             "later items shift by one; --seq overrides); decision: date today, status accepted; procedure: thresholds {}.",
+             "Examples:",
+             "  kb add games/deadlock/launch/options --type fact --title 'Steam launch options' --value 'gamemoderun %command%' \\",
+             "     --probe 'grep -q gamemoderun ~/.steam/steam/userdata/1/config/localconfig.vdf' --source-path localconfig.vdf --source-locator 'apps 1422450'",
+             "  kb add setup/items/fix-x --type item --kind backlog --priority 2 --title 'Fix x' --body 'detail line'",
+             "Before writing, the 5 nearest entries of the topic are listed; a title/value overlap of 0.5 or more "
+             "is refused unless --dup-ok."]
+    return "\n".join(rows)
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="kb", description=__doc__.strip().split("\n")[0],
+                                 epilog="Exit codes: 0 ok, 1 not found/invalid, 2 usage, 3 schema too new. "
+                                        "Run kb COMMAND --help for each command; kb add --help lists the entry types.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND")
+    sub.required = True
+
+    def sp(name, fn, help_, epilog=None, **kw):
+        p = sub.add_parser(name, help=help_, description=help_, epilog=epilog,
+                           formatter_class=argparse.RawDescriptionHelpFormatter, **kw)
+        p.set_defaults(fn=fn)
+        return p
+
+    def hist(p):
+        p.add_argument("--history", action="store_true", help="include superseded entries")
+
+    p = sp("ls", cmd_ls, "list topics, or the children of PATH (path, alias or id)")
+    p.add_argument("path", nargs="?")
+    p.add_argument("--tree", action="store_true", help=f"indented tree, capped at {TREE_LINES} lines or {TREE_CHARS} chars")
+    p.add_argument("--all", action="store_true", help="include done items")
+    p.add_argument("--body", action="store_true", help="for an entry: also print the body lines")
+    hist(p)
+    p.add_argument("--json", action="store_true")
+    p = sp("find", cmd_find, "find paths whose name, title or aliases contain all WORDS (none: all, e.g. with --type)")
+    p.add_argument("words", nargs="*")
+    p.add_argument("--under")
+    p.add_argument("--type")
+    p.add_argument("--status")
+    hist(p)
+    p.add_argument("--json", action="store_true")
+    p = sp("get", cmd_get, "show one entry by path, id or alias (a category lists its children)")
+    p.add_argument("target")
+    p.add_argument("--field", help="print only this field (dotted, e.g. source.path)")
+    p.add_argument("--why", action="store_true", help="show how the argument resolved (alias/id/ref chain)")
+    p.add_argument("--body", action="store_true", help="also print the body lines")
+    hist(p)
+    p.add_argument("--json", action="store_true")
+    p = sp("links", cmd_links, "show outgoing and incoming links, refs and supersede chain of an entry")
+    p.add_argument("target")
+    p.add_argument("--depth", type=int, default=1)
+    p.add_argument("--json", action="store_true")
+    p = sp("search", cmd_search, "regex search over every entry's text; each entry is reported once")
+    p.add_argument("regex", nargs="?")
+    p.add_argument("--under")
+    p.add_argument("--type")
+    p.add_argument("--status")
+    p.add_argument("--commit", metavar="SHA")
+    p.add_argument("--path", dest="path_field", metavar="P", help="entries whose path/source.path contains P")
+    p.add_argument("--body", action="store_true", help="also show matches inside body lines")
+    hist(p)
+    p.add_argument("--json", action="store_true")
+
+    p = sp("ask", cmd_ask, "answer WORDS in one call: alias, id, title, then ranked word match; AMBIGUOUS lists candidates",
+           epilog="Prints PATH | value | source | verified | rel for one clear winner; a category lists its children. "
+                  "--body adds the body lines. Exit 1: nothing found (not recorded).")
+    p.add_argument("words", nargs="+")
+    p.add_argument("--body", action="store_true", help="also print the body lines")
+    p.add_argument("--under", metavar="PATH")
+    p.add_argument("--json", action="store_true")
+    p = sp("hot", cmd_hot, "print the hot sheet: entries marked hot (kb set ID --field hot=true) as alias=value, plus the cheat sheet",
+           epilog="Header HOT <hash8> is a hash of the whole sheet body, so it changes whenever a line does.")
+
+    p = sp("add", cmd_add, "add an entry at PATH (topic/.../name)", epilog=types_help())
+    p.add_argument("path")
+    p.add_argument("--type", required=True, choices=sorted(TYPES))
+    p.add_argument("--title", required=True)
+    p.add_argument("--value")
+    p.add_argument("--body", action="append", help="repeatable: one body line")
+    p.add_argument("--alias", action="append")
+    p.add_argument("--commit", action="append", metavar="SHA")
+    p.add_argument("--link", action="append", metavar="REL=ID")
+    p.add_argument("--since", metavar="DATE")
+    p.add_argument("--id", help="explicit id (default: slug of the last path segment)")
+    p.add_argument("--field", action="append", metavar="KEY=VALUE", help="any field; VALUE is JSON if it parses; dotted keys nest")
+    p.add_argument("--probe", help="fact: read-only command (exit 0 = still true)")
+    p.add_argument("--probe-timeout", type=float)
+    p.add_argument("--probe-none", metavar="REASON", help="fact: nothing can check it")
+    p.add_argument("--source-path")
+    p.add_argument("--source-locator")
+    p.add_argument("--kind", help="item: " + "|".join(ITEM_KINDS) + "; warning: " + "|".join(WARNING_KINDS))
+    p.add_argument("--scenario", help="warning, context: the task or situation it applies to")
+    p.add_argument("--steps", type=int, help="warning: tool calls from the first lookup to the one that gave the info used")
+    p.add_argument("--noise", help="warning: what was irrelevant")
+    p.add_argument("--shortcut", help="warning: the call that would have sufficed")
+    p.add_argument("--status")
+    p.add_argument("--priority", type=int)
+    p.add_argument("--opened")
+    p.add_argument("--seq", type=int)
+    p.add_argument("--date")
+    p.add_argument("--decision")
+    p.add_argument("--step", action="append", help="procedure: repeatable step")
+    p.add_argument("--dup-ok", action="store_true", help="write even if a near-duplicate exists")
+    p = sp("mkcat", cmd_mkcat, "create a category (or a topic file when PATH has one segment)")
+    p.add_argument("path")
+    p.add_argument("--title", required=True)
+    p.add_argument("--alias", action="append")
+    p = sp("set", cmd_set, "change fields of an entry or a category (title, aliases)")
+    p.add_argument("target")
+    p.add_argument("--title")
+    p.add_argument("--value")
+    p.add_argument("--body", action="append", help="replace body; repeatable")
+    p.add_argument("--add-body", action="append")
+    p.add_argument("--alias", action="append", help="add an alias")
+    p.add_argument("--unalias", action="append")
+    p.add_argument("--commit", action="append")
+    p.add_argument("--status")
+    p.add_argument("--probe")
+    p.add_argument("--probe-timeout", type=float)
+    p.add_argument("--probe-none", metavar="REASON")
+    p.add_argument("--source-path")
+    p.add_argument("--source-locator")
+    p.add_argument("--field", action="append", metavar="KEY=VALUE")
+    p.add_argument("--unset", action="append", metavar="KEY", help="remove a field; a dotted KEY removes a nested one (thresholds.x)")
+    p = sp("close", cmd_close, "close an item (status done, closed date)")
+    p.add_argument("target")
+    p.add_argument("--date")
+    p = sp("link", cmd_link, "link entry A to entry B: A REL B", epilog="rels: " + ", ".join(RELS))
+    p.add_argument("a", metavar="A")
+    p.add_argument("rel", metavar="REL")
+    p.add_argument("b", metavar="B")
+    p.add_argument("--remove", action="store_true")
+    p = sp("ref", cmd_ref, "also list entry ID under category PATH (browse-only ref)")
+    p.add_argument("id")
+    p.add_argument("--at", required=True, metavar="PATH")
+    p.add_argument("--remove", action="store_true")
+    p = sp("supersede", cmd_supersede, "mark OLD superseded by NEW (OLD stays, hidden unless --history)")
+    p.add_argument("old")
+    p.add_argument("new")
+    p = sp("mv", cmd_mv, "move PATH to NEWPATH; ids keep links and refs valid")
+    p.add_argument("path")
+    p.add_argument("newpath")
+    p = sp("rm", cmd_rm, "remove PATH; refuses while linked, ref'd or non-empty unless --force")
+    p.add_argument("path")
+    p.add_argument("--force", action="store_true")
+    p = sp("edit", cmd_edit, "edit an entry as JSON in $EDITOR; invalid or frozen changes are rejected")
+    p.add_argument("target")
+
+    p = sp("probe", cmd_probe, "run read-only exit-status probes of facts and report the ones that fail",
+           epilog="Verified times are cached in $KB_CACHE (default ~/.cache/kb/verified.json); with --stale only probes "
+                  "not verified within that age are run. Probe: none facts are reported UNCHECKED. Exit 1 if any FAIL.")
+    p.add_argument("path", nargs="?")
+    p.add_argument("--cat", metavar="C", help="same as PATH")
+    p.add_argument("--budget", type=float, default=30.0, help="total seconds for all probes (default 30)")
+    p.add_argument("--ssh", metavar="HOST", help="run the probes on HOST")
+    p.add_argument("--stale", metavar="AGE", help="only probes unverified for AGE (e.g. 30d)")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p = sp("validate", cmd_validate, "check the whole store; exit 1 on any error")
+    p.add_argument("--orphans", action="store_true", help="also list empty categories and facts with no probe or source")
+    p.add_argument("--json", action="store_true")
+    p = sp("fmt", cmd_fmt, "rewrite store files in canonical form")
+    p.add_argument("--check", action="store_true", help="only report files that differ (exit 1)")
+    p = sp("render", cmd_render, "print open items (--open) or a category in full (--cat, --md for Markdown)")
+    p.add_argument("--open", action="store_true")
+    p.add_argument("--cat", metavar="C")
+    p.add_argument("--md", action="store_true")
+    hist(p)
+
+    p = sp("import-state", cmd_import_state, "import a state.json (state.sh) as item entries, keeping its order in seq")
+    p.add_argument("file")
+    p.add_argument("--cat", default="setup/items", metavar="PATH")
+    p.add_argument("--replace", action="store_true", help="overwrite entries already there")
+    p = sp("export-state", cmd_export_state, "write all item entries as a state.json document (stdout, or --out)")
+    p.add_argument("--out", metavar="FILE")
+    p = sp("import-facts", cmd_import_facts, "import a host-facts Markdown file: one fact per '- ' bullet",
+           epilog="Only '- ' bullets are imported. Numbered lists (for example 'Safe to reclaim, in this order'), headings "
+                  "and intro paragraphs are skipped: add them by hand (procedure entries, kb add --step) so none is lost.")
+    p.add_argument("file")
+    p.add_argument("--cat", required=True, metavar="PATH")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    a = ap.parse_args(argv)
+    try:
+        return a.fn(a) or 0
+    except KBError as ex:
+        msg = str(ex)
+        print(msg if msg.startswith("kb:") else "kb: " + msg, file=sys.stderr)
+        return ex.code
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

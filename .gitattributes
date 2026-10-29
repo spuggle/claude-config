@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+scripts/kb text eol=lf
+claude-worktree/git-hooks/* text eol=lf

@@ -1,0 +1,6 @@
+Bash	(^|[;&|('"]\s*|\s)git(\s+-C\s+\S+)?\s+commit\b	claude-worktree	committing: commit discipline, worktree and report rules
+Edit|Write|MultiEdit	(^|/)SKILL\.md$|^[a-z0-9-]+/references/[^/]+\.md$	instruction-layer	editing a skill: one home per fact, verify references, test the change
+Edit|Write|MultiEdit	(^|/)docs/HANDOFF\.md$	instruction-layer	editing a handoff document: layout, attention items, decision records
+Edit|Write|MultiEdit	(^|/)docs/state\.json$	instruction-layer	editing open items by hand: use scripts/state.sh instead
+Edit|Write|MultiEdit	(^|/)docs/kb/[^/]+\.json$	instruction-layer	editing the kb store by hand: use scripts/kb (add, set, edit) instead
+Edit|Write|MultiEdit	^/home/[^/]+/\.claude/projects/[^/]+/memory/	instruction-layer	writing memory: one fact per file, pointer in MEMORY.md, no duplicated facts

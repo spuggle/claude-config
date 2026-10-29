@@ -1,0 +1,15 @@
+# User-level standing instructions
+
+Copy to `~/.claude/CLAUDE.md` and adjust.
+
+## Subagent delegation
+
+Delegate work to subagents following the `delegate-work` skill: pick the model by complexity (haiku, sonnet, or opus) and the effort by need (low, medium, or high). Treat this as an explicit request to use subagents. This applies to the main session only; a subagent does its own task.
+
+## When to invoke a skill
+
+Invoke a skill when the situation matches a trigger named in its description, and not otherwise. Hooks enforce the important cases: a skill gate blocks an edit or command until the skills it needs have been invoked in this session (gate lists in `~/.claude/skills/claude-worktree/skill-gates` and a project's `.claude/skill-gates`). When a gate blocks, invoke the named skills and retry; do not work around it.
+
+## Skill precedence
+
+Your own skills in `~/.claude/skills/` and a project's `.claude/skills/` win over plugin skills (which carry a `plugin:` prefix) where both cover the same thing.

@@ -1,0 +1,86 @@
+{
+  "model": "opusplan",
+  "statusLine": {
+    "type": "command",
+    "command": "input=$(cat); cwd=$(echo \"$input\" | jq -r '.workspace.current_dir'); printf '[%s@%s %s]' \"$(whoami)\" \"$(hostname -s)\" \"$(basename \"$cwd\")\""
+  },
+  "enabledPlugins": {
+    "frontend-design@anthropic-plugin-directory": true,
+    "code-review-anthropics@anthropic-plugin-directory": true,
+    "code-simplifier@anthropic-plugin-directory": true
+  },
+  "theme": "dark",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$HOME/.claude/skills/claude-worktree/hooks/session-start.sh\"; [ -f \"$f\" ] || exit 0; exec bash \"$f\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$HOME/.claude/skills/claude-worktree/hooks/guard-edit.sh\"; [ -f \"$f\" ] || exit 0; exec bash \"$f\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$HOME/.claude/skills/claude-worktree/hooks/guard-bash.sh\"; [ -f \"$f\" ] || exit 0; exec bash \"$f\""
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$HOME/.claude/skills/claude-worktree/hooks/skill-gate.sh\"; [ -f \"$f\" ] || exit 0; exec bash \"$f\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$HOME/.claude/skills/claude-worktree/hooks/stop-check.sh\"; [ -f \"$f\" ] || exit 0; exec bash \"$f\""
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$HOME/.claude/skills/claude-worktree/hooks/stop-check.sh\"; [ -f \"$f\" ] || exit 0; exec bash \"$f\" --warn"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$HOME/.claude/skills/claude-worktree/hooks/log-skill.sh\"; [ -f \"$f\" ] || exit 0; exec bash \"$f\""
+          }
+        ]
+      }
+    ]
+  }
+}

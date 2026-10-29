@@ -1,0 +1,7 @@
+/synced/
+__pycache__/
+*.pyc
+docs/kb/.lock
+docs/kb/.kb-*.tmp
+# Private data lives in the private layer (point KB_DIR at it); never commit it here.
+docs/

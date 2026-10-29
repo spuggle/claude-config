@@ -1,0 +1,9 @@
+Edit|Write|MultiEdit	(^|/)SKILL\.md$	agent:advisor	core workflow: consult the advisor (read-only Opus) before changing skills, hooks or kb
+Edit|Write|MultiEdit	^[a-z0-9-]+/references/[^/]+\.md$	agent:advisor	core workflow: consult the advisor (read-only Opus) before changing skills, hooks or kb
+Edit|Write|MultiEdit	^claude-worktree/hooks/	agent:advisor	core workflow: consult the advisor (read-only Opus) before changing skills, hooks or kb
+Edit|Write|MultiEdit	^scripts/kb$	agent:advisor	core workflow: consult the advisor (read-only Opus) before changing skills, hooks or kb
+Edit|Write|MultiEdit	^claude-worktree/skill-gates$	agent:advisor	core workflow: consult the advisor (read-only Opus) before changing skills, hooks or kb
+Edit|Write|MultiEdit	^\.claude/skill-gates$	agent:advisor	core workflow: consult the advisor (read-only Opus) before changing skills, hooks or kb
+Edit|Write|MultiEdit	^agents/advisor\.md$	agent:advisor	core workflow: consult the advisor (read-only Opus) before changing skills, hooks or kb
+Edit|Write|MultiEdit	^scripts/check\.sh$	agent:advisor	core workflow: consult the advisor (read-only Opus) before changing skills, hooks or kb
+Edit|Write|MultiEdit	^scripts/shellast\.py$	agent:advisor	core workflow: consult the advisor (read-only Opus) before changing skills, hooks or kb
